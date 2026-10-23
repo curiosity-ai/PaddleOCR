@@ -67,7 +67,7 @@
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "typescript": "^5.9.3",
-    "vite": "^6.4.1",
+    "vite": "^6.4.4",
     "vite-plugin-dts": "^1.0.5"
   }
 }
