@@ -73,6 +73,25 @@ public class OtslTableTests
     }
 
     [Fact]
+    public void LineBreaksInsideACellBecomeBr()
+    {
+        string html = OtslTable.ToHtml("<fcel>Name<fcel>Address<nl><fcel>Bob<fcel>1 Main St\nSpringfield\r\nUSA<nl>");
+
+        Assert.Equal(
+            "<table><tr><td>Name</td><td>Address</td></tr><tr><td>Bob</td><td>1 Main St<br>Springfield<br>USA</td></tr></table>",
+            html);
+        Assert.DoesNotContain('\n', html);
+    }
+
+    [Fact]
+    public void MarkupInACellIsEncodedBeforeBreaksAreWritten()
+    {
+        string html = OtslTable.ToHtml("<fcel>a<b\nc<nl>");
+
+        Assert.Contains("<td>a&lt;b<br>c</td>", html);
+    }
+
+    [Fact]
     public void EmptyInputProducesNoTable()
     {
         Assert.Equal(string.Empty, OtslTable.ToHtml(string.Empty));

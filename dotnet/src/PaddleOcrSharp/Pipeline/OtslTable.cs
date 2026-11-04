@@ -365,7 +365,7 @@ public static partial class OtslTable
                     builder.Append(" colspan=\"").Append(cell.ColumnSpan).Append('"');
                 }
 
-                builder.Append('>').Append(WebUtility.HtmlEncode(cell.Text.Trim())).Append("</td>");
+                builder.Append('>').Append(EncodeCellText(cell.Text)).Append("</td>");
             }
 
             builder.Append("</tr>");
@@ -373,6 +373,21 @@ public static partial class OtslTable
 
         return builder.Append("</table>").ToString();
     }
+
+    /// <summary>
+    /// HTML-encodes a cell's text, writing each line break inside it as <c>&lt;br&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberate deviation from upstream, which leaves the raw line feed in the <c>td</c>. HTML
+    /// treats it as a space, and a consumer that turns the table into another format (a markdown
+    /// pipe table, a cell grid) loses the break or, worse, has to escape it. <c>&lt;br&gt;</c>
+    /// is the one spelling of a line break every HTML reader agrees on.
+    /// </remarks>
+    private static string EncodeCellText(string text) =>
+        WebUtility.HtmlEncode(text.Trim())
+            .Replace("\r\n", "<br>", StringComparison.Ordinal)
+            .Replace("\n", "<br>", StringComparison.Ordinal)
+            .Replace("\r", "<br>", StringComparison.Ordinal);
 
     private sealed record Cell(int Row, int Column, int RowSpan, int ColumnSpan, string Text);
 }
