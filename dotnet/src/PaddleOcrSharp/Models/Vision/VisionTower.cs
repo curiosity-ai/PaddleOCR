@@ -158,8 +158,10 @@ public sealed class VisionTower
         using PooledBuffer normed = TensorPool.Rent(tokens * width);
         using PooledBuffer queries = TensorPool.Rent(tokens * width);
         using PooledBuffer keys = TensorPool.Rent(tokens * width);
-        using PooledBuffer values = TensorPool.Rent(tokens * width);
-        using PooledBuffer attention = TensorPool.Rent(tokens * width);
+        // Per-head rows of the values and the attention output are padded to whole cache lines.
+        int rowStride = (headDim + 15) & ~15;
+        using PooledBuffer values = TensorPool.Rent(heads * tokens * rowStride);
+        using PooledBuffer attention = TensorPool.Rent(heads * tokens * rowStride);
         using PooledBuffer packed = TensorPool.Rent(tokens * width);
         using PooledBuffer intermediate = TensorPool.Rent(tokens * _config.IntermediateSize);
 
@@ -202,7 +204,7 @@ public sealed class VisionTower
 
             using (profile?.Measure("rope+split"))
             {
-                SplitHeads(packed.Memory, values.Memory, tokens, heads, headDim);
+                SplitHeads(packed.Memory, values.Memory, tokens, heads, headDim, rowStride);
             }
 
             using (profile?.Measure("attention"))
@@ -211,12 +213,12 @@ public sealed class VisionTower
                 // per head, so nothing outside it can see where its time went.
                 Attention.Bidirectional(
                     queries.Memory, keys.Memory, values.Memory, attention.Memory,
-                    heads, tokens, headDim, scale, profile);
+                    heads, tokens, headDim, scale, rowStride, profile);
             }
 
             using (profile?.Measure("rope+split"))
             {
-                MergeHeads(attention.Memory, packed.Memory, tokens, heads, headDim);
+                MergeHeads(attention.Memory, packed.Memory, tokens, heads, headDim, rowStride);
             }
 
             using (profile?.Measure("out gemm"))
@@ -364,7 +366,7 @@ public sealed class VisionTower
         ReadOnlyMemory<float> sin)
     {
         int width = heads * headDim;
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        Parallelism.For(heads, head =>
         {
             int headBase = head * tokens * headDim;
             ReadOnlySpan<float> source = packed.Span;
@@ -388,19 +390,20 @@ public sealed class VisionTower
         Memory<float> destination,
         int tokens,
         int heads,
-        int headDim)
+        int headDim,
+        int rowStride)
     {
         int width = heads * headDim;
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        Parallelism.For(heads, head =>
         {
-            int headBase = head * tokens * headDim;
+            int headBase = head * tokens * rowStride;
             ReadOnlySpan<float> source = packed.Span;
             Span<float> target = destination.Span;
 
             for (int token = 0; token < tokens; token++)
             {
                 source.Slice((token * width) + (head * headDim), headDim)
-                    .CopyTo(target.Slice(headBase + (token * headDim), headDim));
+                    .CopyTo(target.Slice(headBase + (token * rowStride), headDim));
             }
         });
     }
@@ -411,18 +414,19 @@ public sealed class VisionTower
         Memory<float> destination,
         int tokens,
         int heads,
-        int headDim)
+        int headDim,
+        int rowStride)
     {
         int width = heads * headDim;
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        Parallelism.For(heads, head =>
         {
-            int headBase = head * tokens * headDim;
+            int headBase = head * tokens * rowStride;
             ReadOnlySpan<float> source = perHead.Span;
             Span<float> target = destination.Span;
 
             for (int token = 0; token < tokens; token++)
             {
-                source.Slice(headBase + (token * headDim), headDim)
+                source.Slice(headBase + (token * rowStride), headDim)
                     .CopyTo(target.Slice((token * width) + (head * headDim), headDim));
             }
         });

@@ -421,12 +421,9 @@ public sealed class ErnieDecoder
     {
         float scale = _config.AttentionScale;
 
-        Parallel.For(
-            0,
+        Parallelism.For(
             batch * queryHeads,
-            Parallelism.Options,
-            () => TensorPool.Rent(longest),
-            (index, _, scores) =>
+            index =>
             {
                 int sequence = index / queryHeads;
                 int head = index % queryHeads;
@@ -438,7 +435,8 @@ public sealed class ErnieDecoder
                 ReadOnlySpan<float> valueSpan = cache.ValueWindow(layer, limit).Span;
                 ReadOnlySpan<float> query = queries.Span
                     .Slice((sequence * queryWidth) + (head * headDim), headDim);
-                Span<float> scoreSpan = scores.Span[..limit];
+                using PooledBuffer scores = TensorPool.Rent(limit);
+                Span<float> scoreSpan = scores.Span;
 
                 int keyOffset = keyValueHead * headDim;
                 for (int j = 0; j < limit; j++)
@@ -458,10 +456,7 @@ public sealed class ErnieDecoder
                         Kernels.AddScaled(target, valueSpan.Slice((j * keyValueWidth) + keyOffset, headDim), weight);
                     }
                 }
-
-                return scores;
-            },
-            scores => scores.Dispose());
+            });
     }
 
     /// <summary>
@@ -542,12 +537,9 @@ public sealed class ErnieDecoder
         ReadOnlyMemory<float> keyMemory = cache.KeyWindow(layer, visible);
         ReadOnlyMemory<float> valueMemory = cache.ValueWindow(layer, visible);
 
-        Parallel.For(
-            0,
+        Parallelism.For(
             queryHeads * tokenCount,
-            Parallelism.Options,
-            () => TensorPool.Rent(visible),
-            (index, _, scores) =>
+            index =>
             {
                 int head = index / tokenCount;
                 int token = index % tokenCount;
@@ -557,7 +549,8 @@ public sealed class ErnieDecoder
                 ReadOnlySpan<float> query = queries.Span.Slice((token * queryWidth) + (head * headDim), headDim);
                 ReadOnlySpan<float> keySpan = keyMemory.Span;
                 ReadOnlySpan<float> valueSpan = valueMemory.Span;
-                Span<float> scoreSpan = scores.Span[..limit];
+                using PooledBuffer scores = TensorPool.Rent(limit);
+                Span<float> scoreSpan = scores.Span;
 
                 int keyOffset = keyValueHead * headDim;
                 for (int j = 0; j < limit; j++)
@@ -577,10 +570,7 @@ public sealed class ErnieDecoder
                         Kernels.AddScaled(target, valueSpan.Slice((j * keyValueWidth) + keyOffset, headDim), weight);
                     }
                 }
-
-                return scores;
-            },
-            scores => scores.Dispose());
+            });
     }
 
     private sealed class LayerWeights

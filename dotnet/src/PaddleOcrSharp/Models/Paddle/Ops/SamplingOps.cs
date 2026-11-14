@@ -45,7 +45,7 @@ internal static class SamplingOps
             _ => throw new NotSupportedException($"grid_sample mode '{mode}' is not supported."),
         };
 
-        Parallel.For(0, batch * outHeight, Parallelism.Options, index =>
+        Parallelism.For(batch * outHeight, index =>
         {
             int n = index / outHeight;
             int oy = index % outHeight;
@@ -181,7 +181,7 @@ internal static class SamplingOps
             ? (float)(inWidth - 1) / (outWidth - 1)
             : (float)inWidth / outWidth;
 
-        Parallel.For(0, batch * channels, Parallelism.Options, plane =>
+        Parallelism.For(batch * channels, plane =>
         {
             int inputBase = plane * inHeight * inWidth;
             int outputBase = plane * outHeight * outWidth;
@@ -255,7 +255,7 @@ internal static class SamplingOps
             ? (float)(inWidth - 1) / (outWidth - 1)
             : (float)inWidth / outWidth;
 
-        Parallel.For(0, batch * channels, Parallelism.Options, plane =>
+        Parallelism.For(batch * channels, plane =>
         {
             int inputBase = plane * inHeight * inWidth;
             int outputBase = plane * outHeight * outWidth;

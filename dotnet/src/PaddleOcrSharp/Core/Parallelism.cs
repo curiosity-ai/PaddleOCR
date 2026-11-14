@@ -79,6 +79,51 @@ public static class Parallelism
     /// </remarks>
     public static Scope Use(ParallelOptions? options) => new(options);
 
+    /// <summary>
+    /// Sets the options the calling thread's kernels see and returns what was there, for a worker
+    /// thread that adopts the options of the caller whose region it is helping with.
+    /// </summary>
+    internal static ParallelOptions? SetScoped(ParallelOptions? options)
+    {
+        ParallelOptions? previous = Scoped.Value;
+        Scoped.Value = options;
+        return previous;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> for every index in <c>[0, count)</c> across the kernels'
+    /// degree of parallelism: the drop-in for <c>Parallel.For(0, count, Parallelism.Options, body)</c>.
+    /// </summary>
+    /// <remarks>
+    /// Regions go to <see cref="WorkTeam"/>, whose threads stay awake between them; a region that
+    /// finds the team busy, or that asks for a single worker, takes <see cref="Parallel.For(int, int, ParallelOptions, Action{int})"/>
+    /// instead. Cancellation and exceptions surface as they do from that method.
+    /// </remarks>
+    /// <param name="count">Number of items.</param>
+    /// <param name="body">The work for one item.</param>
+    public static void For(int count, Action<int> body)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        ParallelOptions options = Options;
+        int workers = options.MaxDegreeOfParallelism;
+        if (workers <= 0)
+        {
+            workers = Environment.ProcessorCount;
+        }
+
+        workers = Math.Min(workers, count);
+        if (workers > 1 && WorkTeam.TryRun(count, workers, options, body))
+        {
+            return;
+        }
+
+        Parallel.For(0, count, options, body);
+    }
+
     /// <summary>Elements below which splitting a pass across threads costs more than it saves.</summary>
     private const int MinimumChunk = 1 << 15;
 
@@ -109,7 +154,7 @@ public static class Parallelism
         }
 
         int size = ((length - 1) / chunks) + 1;
-        Parallel.For(0, chunks, Options, chunk =>
+        For(chunks, chunk =>
         {
             int start = chunk * size;
             body(start, Math.Min(length, start + size));

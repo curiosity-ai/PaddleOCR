@@ -162,7 +162,7 @@ internal static class ReduceOps
     {
         int segments = count / inner;
 
-        Parallel.For(0, segments, Parallelism.Options, i =>
+        Parallelism.For(segments, i =>
         {
             ReadOnlySpan<long> segment = source.AsSpan(i * inner, inner);
             destination[i] = segment.ContainsAnyExcept(0L) ? 1 : 0;

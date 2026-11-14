@@ -238,7 +238,7 @@ internal static class ConvOps
     {
         int rowFloats = outWidth * patch;
 
-        Parallel.For(0, rows, Parallelism.Options, r =>
+        Parallelism.For(rows, r =>
         {
             int outY = rowStart + r;
             Span<float> rowColumns = MemoryMarshal.Cast<byte, float>(
@@ -303,7 +303,7 @@ internal static class ConvOps
         int interiorEnd = Math.Clamp(inWidth - ((kernelWidth - 1) * dilationX) + padLeft, interiorStart, outWidth);
         bool vectorise = Simd.Use256 && strideX == 1 && interiorEnd - interiorStart >= Vector256<float>.Count;
 
-        Parallel.For(0, batch * channels, Parallelism.Options, index =>
+        Parallelism.For(batch * channels, index =>
         {
             int n = index / channels;
             int c = index % channels;
@@ -517,7 +517,7 @@ internal static class ConvOps
         float[] destination = result.Floats!;
         bool isMax = poolingType == "max";
 
-        Parallel.For(0, batch * channels, Parallelism.Options, index =>
+        Parallelism.For(batch * channels, index =>
         {
             int inputBase = index * inHeight * inWidth;
             int outputBase = index * outHeight * outWidth;
@@ -586,7 +586,7 @@ internal static class ConvOps
         float[] destination = result.Floats!;
         bool isMax = poolingType == "max";
 
-        Parallel.For(0, batch * channels, Parallelism.Options, index =>
+        Parallelism.For(batch * channels, index =>
         {
             int inputBase = index * inHeight * inWidth;
             int outputBase = index * outHeight * outWidth;

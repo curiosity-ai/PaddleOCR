@@ -47,16 +47,20 @@ internal static class AttentionKernels
     /// <param name="queries">Queries, <c>[rows, headDim]</c> row-major.</param>
     /// <param name="rows">Query rows in this block.</param>
     /// <param name="headDim">Width of one head — the reduction length.</param>
-    /// <param name="keysT">Keys transposed to <c>[headDim, tokens]</c>.</param>
-    /// <param name="tokens">Sequence length, and the score matrix's row length.</param>
+    /// <param name="keysT">Keys transposed to <c>[headDim, keyStride]</c>.</param>
+    /// <param name="tokens">Sequence length.</param>
+    /// <param name="keyStride">Distance between rows of <paramref name="keysT"/>, at least <paramref name="tokens"/>.</param>
     /// <param name="scores">Receives <c>[rows, tokens]</c>, written in full.</param>
+    /// <param name="scoreStride">Distance between rows of <paramref name="scores"/>, at least <paramref name="tokens"/>.</param>
     internal static void Scores(
         ReadOnlySpan<float> queries,
         int rows,
         int headDim,
         ReadOnlySpan<float> keysT,
         int tokens,
-        Span<float> scores)
+        int keyStride,
+        Span<float> scores,
+        int scoreStride)
     {
         // Token block outermost, row group innermost. A tile of the transposed keys is
         // `headDim` lines of `ScoreColumns` floats — 4.6 KB at a head width of 72 — and the row
@@ -69,12 +73,12 @@ internal static class AttentionKernels
             int row = 0;
             for (; row <= rows - ScoreRows; row += ScoreRows)
             {
-                ScoreQuad(queries, row, headDim, keysT, tokens, scores, token, ScoreColumns);
+                ScoreQuad(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, ScoreColumns);
             }
 
             for (; row < rows; row++)
             {
-                ScoreSingle(queries, row, headDim, keysT, tokens, scores, token, ScoreColumns);
+                ScoreSingle(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, ScoreColumns);
             }
         }
 
@@ -84,12 +88,12 @@ internal static class AttentionKernels
             int row = 0;
             for (; row <= rows - ScoreRows; row += ScoreRows)
             {
-                ScoreQuad(queries, row, headDim, keysT, tokens, scores, token, remaining);
+                ScoreQuad(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, remaining);
             }
 
             for (; row < rows; row++)
             {
-                ScoreSingle(queries, row, headDim, keysT, tokens, scores, token, remaining);
+                ScoreSingle(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, remaining);
             }
         }
     }
@@ -101,7 +105,9 @@ internal static class AttentionKernels
         int headDim,
         ReadOnlySpan<float> keysT,
         int tokens,
+        int keyStride,
         Span<float> scores,
+        int scoreStride,
         int first,
         int count)
     {
@@ -110,7 +116,7 @@ internal static class AttentionKernels
         ref float s = ref MemoryMarshal.GetReference(scores);
 
         int q0 = row * headDim;
-        int s0 = row * tokens;
+        int s0 = row * scoreStride;
         int width = Vector256<float>.Count;
         int token = first;
         int end = first + count;
@@ -127,7 +133,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * tokens) + token;
+                    int column = (d * keyStride) + token;
                     Vector512<float> kLo = Vector512.LoadUnsafe(ref k, (nuint)column);
                     Vector512<float> kHi = Vector512.LoadUnsafe(ref k, (nuint)(column + wide));
 
@@ -150,12 +156,12 @@ internal static class AttentionKernels
 
                 z0.StoreUnsafe(ref s, (nuint)(s0 + token));
                 y0.StoreUnsafe(ref s, (nuint)(s0 + token + wide));
-                z1.StoreUnsafe(ref s, (nuint)(s0 + tokens + token));
-                y1.StoreUnsafe(ref s, (nuint)(s0 + tokens + token + wide));
-                z2.StoreUnsafe(ref s, (nuint)(s0 + (2 * tokens) + token));
-                y2.StoreUnsafe(ref s, (nuint)(s0 + (2 * tokens) + token + wide));
-                z3.StoreUnsafe(ref s, (nuint)(s0 + (3 * tokens) + token));
-                y3.StoreUnsafe(ref s, (nuint)(s0 + (3 * tokens) + token + wide));
+                z1.StoreUnsafe(ref s, (nuint)(s0 + scoreStride + token));
+                y1.StoreUnsafe(ref s, (nuint)(s0 + scoreStride + token + wide));
+                z2.StoreUnsafe(ref s, (nuint)(s0 + (2 * scoreStride) + token));
+                y2.StoreUnsafe(ref s, (nuint)(s0 + (2 * scoreStride) + token + wide));
+                z3.StoreUnsafe(ref s, (nuint)(s0 + (3 * scoreStride) + token));
+                y3.StoreUnsafe(ref s, (nuint)(s0 + (3 * scoreStride) + token + wide));
             }
         }
 
@@ -170,7 +176,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * tokens) + token;
+                    int column = (d * keyStride) + token;
                     Vector256<float> kLo = Vector256.LoadUnsafe(ref k, (nuint)column);
                     Vector256<float> kHi = Vector256.LoadUnsafe(ref k, (nuint)(column + width));
 
@@ -193,12 +199,12 @@ internal static class AttentionKernels
 
                 a0.StoreUnsafe(ref s, (nuint)(s0 + token));
                 b0.StoreUnsafe(ref s, (nuint)(s0 + token + width));
-                a1.StoreUnsafe(ref s, (nuint)(s0 + tokens + token));
-                b1.StoreUnsafe(ref s, (nuint)(s0 + tokens + token + width));
-                a2.StoreUnsafe(ref s, (nuint)(s0 + (2 * tokens) + token));
-                b2.StoreUnsafe(ref s, (nuint)(s0 + (2 * tokens) + token + width));
-                a3.StoreUnsafe(ref s, (nuint)(s0 + (3 * tokens) + token));
-                b3.StoreUnsafe(ref s, (nuint)(s0 + (3 * tokens) + token + width));
+                a1.StoreUnsafe(ref s, (nuint)(s0 + scoreStride + token));
+                b1.StoreUnsafe(ref s, (nuint)(s0 + scoreStride + token + width));
+                a2.StoreUnsafe(ref s, (nuint)(s0 + (2 * scoreStride) + token));
+                b2.StoreUnsafe(ref s, (nuint)(s0 + (2 * scoreStride) + token + width));
+                a3.StoreUnsafe(ref s, (nuint)(s0 + (3 * scoreStride) + token));
+                b3.StoreUnsafe(ref s, (nuint)(s0 + (3 * scoreStride) + token + width));
             }
         }
 
@@ -207,7 +213,7 @@ internal static class AttentionKernels
             float t0 = 0f, t1 = 0f, t2 = 0f, t3 = 0f;
             for (int d = 0; d < headDim; d++)
             {
-                float key = Unsafe.Add(ref k, (d * tokens) + token);
+                float key = Unsafe.Add(ref k, (d * keyStride) + token);
                 t0 += Unsafe.Add(ref q, q0 + d) * key;
                 t1 += Unsafe.Add(ref q, q0 + headDim + d) * key;
                 t2 += Unsafe.Add(ref q, q0 + (2 * headDim) + d) * key;
@@ -215,9 +221,9 @@ internal static class AttentionKernels
             }
 
             Unsafe.Add(ref s, s0 + token) = t0;
-            Unsafe.Add(ref s, s0 + tokens + token) = t1;
-            Unsafe.Add(ref s, s0 + (2 * tokens) + token) = t2;
-            Unsafe.Add(ref s, s0 + (3 * tokens) + token) = t3;
+            Unsafe.Add(ref s, s0 + scoreStride + token) = t1;
+            Unsafe.Add(ref s, s0 + (2 * scoreStride) + token) = t2;
+            Unsafe.Add(ref s, s0 + (3 * scoreStride) + token) = t3;
         }
     }
 
@@ -228,7 +234,9 @@ internal static class AttentionKernels
         int headDim,
         ReadOnlySpan<float> keysT,
         int tokens,
+        int keyStride,
         Span<float> scores,
+        int scoreStride,
         int first,
         int count)
     {
@@ -237,7 +245,7 @@ internal static class AttentionKernels
         ref float s = ref MemoryMarshal.GetReference(scores);
 
         int q0 = row * headDim;
-        int s0 = row * tokens;
+        int s0 = row * scoreStride;
         int width = Vector256<float>.Count;
         int token = first;
         int end = first + count;
@@ -252,7 +260,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * tokens) + token;
+                    int column = (d * keyStride) + token;
                     Vector512<float> v = Vector512.Create(Unsafe.Add(ref q, q0 + d));
                     z0 = Vector512.FusedMultiplyAdd(v, Vector512.LoadUnsafe(ref k, (nuint)column), z0);
                     z1 = Vector512.FusedMultiplyAdd(
@@ -279,7 +287,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * tokens) + token;
+                    int column = (d * keyStride) + token;
                     Vector256<float> v = Vector256.Create(Unsafe.Add(ref q, q0 + d));
                     a0 = Vector256.FusedMultiplyAdd(v, Vector256.LoadUnsafe(ref k, (nuint)column), a0);
                     a1 = Vector256.FusedMultiplyAdd(
@@ -302,7 +310,7 @@ internal static class AttentionKernels
             float sum = 0f;
             for (int d = 0; d < headDim; d++)
             {
-                sum += Unsafe.Add(ref q, q0 + d) * Unsafe.Add(ref k, (d * tokens) + token);
+                sum += Unsafe.Add(ref q, q0 + d) * Unsafe.Add(ref k, (d * keyStride) + token);
             }
 
             Unsafe.Add(ref s, s0 + token) = sum;
@@ -315,12 +323,14 @@ internal static class AttentionKernels
     /// <param name="source">The head's rows, <c>[tokens, headDim]</c>.</param>
     /// <param name="tokens">Number of rows in <paramref name="source"/>.</param>
     /// <param name="headDim">Number of columns in <paramref name="source"/>.</param>
-    /// <param name="destination">Receives <c>[headDim, tokens]</c>.</param>
+    /// <param name="destination">Receives <c>[headDim, keyStride]</c>.</param>
+    /// <param name="keyStride">Distance between destination rows, at least <paramref name="tokens"/>.</param>
     internal static void TransposeHead(
         ReadOnlySpan<float> source,
         int tokens,
         int headDim,
-        Span<float> destination)
+        Span<float> destination,
+        int keyStride)
     {
         // Blocked so neither side walks the whole matrix with a long stride. A head is 72 columns,
         // so a 32-row block of the source is 9 KB and its image in the destination touches 72
@@ -332,7 +342,7 @@ internal static class AttentionKernels
             int tEnd = Math.Min(t0 + Block, tokens);
             for (int d = 0; d < headDim; d++)
             {
-                int column = d * tokens;
+                int column = d * keyStride;
                 for (int t = t0; t < tEnd; t++)
                 {
                     destination[column + t] = source[(t * headDim) + d];
@@ -356,12 +366,15 @@ internal static class AttentionKernels
     /// <summary>
     /// Computes <c>result[r, d] = Σ_t weights[r, t] · values[t, d]</c>.
     /// </summary>
-    /// <param name="weights">Attention weights, <c>[rows, tokens]</c> row-major.</param>
+    /// <param name="weights">Attention weights, <c>[rows, weightStride]</c> row-major.</param>
+    /// <param name="weightStride">Distance between rows of <paramref name="weights"/>.</param>
     /// <param name="rows">Query rows in this block.</param>
     /// <param name="tokens">Sequence length — the reduction length.</param>
-    /// <param name="values">Values, <c>[tokens, headDim]</c> row-major.</param>
+    /// <param name="values">Values, <c>[tokens, valueStride]</c> row-major.</param>
     /// <param name="headDim">Width of one head.</param>
-    /// <param name="result">Receives <c>[rows, headDim]</c>, written in full.</param>
+    /// <param name="valueStride">Distance between rows of <paramref name="values"/>.</param>
+    /// <param name="result">Receives <c>[rows, resultStride]</c>, written in full.</param>
+    /// <param name="resultStride">Distance between rows of <paramref name="result"/>.</param>
     /// <remarks>
     /// <para>
     /// The general kernel keeps this product's output rows in memory and streams the values past
@@ -380,17 +393,20 @@ internal static class AttentionKernels
     /// </remarks>
     internal static void Values(
         ReadOnlySpan<float> weights,
+        int weightStride,
         int rows,
         int tokens,
         ReadOnlySpan<float> values,
         int headDim,
-        Span<float> result)
+        int valueStride,
+        Span<float> result,
+        int resultStride)
     {
-        result[..(rows * headDim)].Clear();
+        result[..(rows * resultStride)].Clear();
 
         if (!Simd.Use256)
         {
-            Fallback(weights, rows, tokens, values, headDim, result);
+            Fallback(weights, weightStride, rows, tokens, values, headDim, valueStride, result, resultStride);
             return;
         }
 
@@ -413,23 +429,23 @@ internal static class AttentionKernels
                     int wide = Vector512<float>.Count;
                     for (; column <= headDim - (2 * wide); column += 2 * wide)
                     {
-                        ValueTileWide512(ref w, ref v, ref y, row, column, chunk, steps, tokens, headDim, wide);
+                        ValueTileWide512(ref w, ref v, ref y, row, column, chunk, steps, weightStride, valueStride, resultStride, wide);
                     }
                 }
 
                 for (; column <= headDim - (2 * width); column += 2 * width)
                 {
-                    ValueTileWide(ref w, ref v, ref y, row, column, chunk, steps, tokens, headDim, width);
+                    ValueTileWide(ref w, ref v, ref y, row, column, chunk, steps, weightStride, valueStride, resultStride, width);
                 }
 
                 for (; column <= headDim - width; column += width)
                 {
-                    ValueTileNarrow(ref w, ref v, ref y, row, column, chunk, steps, tokens, headDim);
+                    ValueTileNarrow(ref w, ref v, ref y, row, column, chunk, steps, weightStride, valueStride, resultStride);
                 }
 
                 for (; column < headDim; column++)
                 {
-                    ValueColumnTail(ref w, ref v, ref y, row, ValueRows, column, chunk, steps, tokens, headDim);
+                    ValueColumnTail(ref w, ref v, ref y, row, ValueRows, column, chunk, steps, weightStride, valueStride, resultStride);
                 }
             }
 
@@ -437,7 +453,7 @@ internal static class AttentionKernels
             {
                 for (int column = 0; column < headDim; column++)
                 {
-                    ValueColumnTail(ref w, ref v, ref y, row, 1, column, chunk, steps, tokens, headDim);
+                    ValueColumnTail(ref w, ref v, ref y, row, 1, column, chunk, steps, weightStride, valueStride, resultStride);
                 }
             }
         }
@@ -453,8 +469,9 @@ internal static class AttentionKernels
         int column,
         int chunk,
         int steps,
-        int tokens,
-        int headDim,
+        int weightStride,
+        int valueStride,
+        int resultStride,
         int width)
     {
         Vector256<float> a0 = Vector256<float>.Zero, b0 = Vector256<float>.Zero;
@@ -462,12 +479,12 @@ internal static class AttentionKernels
         Vector256<float> a2 = Vector256<float>.Zero, b2 = Vector256<float>.Zero;
         Vector256<float> a3 = Vector256<float>.Zero, b3 = Vector256<float>.Zero;
 
-        int w0 = (row * tokens) + chunk;
-        int vBase = (chunk * headDim) + column;
+        int w0 = (row * weightStride) + chunk;
+        int vBase = (chunk * valueStride) + column;
 
         for (int step = 0; step < steps; step++)
         {
-            int offset = vBase + (step * headDim);
+            int offset = vBase + (step * valueStride);
             Vector256<float> lo = Vector256.LoadUnsafe(ref v, (nuint)offset);
             Vector256<float> hi = Vector256.LoadUnsafe(ref v, (nuint)(offset + width));
 
@@ -475,23 +492,23 @@ internal static class AttentionKernels
             a0 = Vector256.FusedMultiplyAdd(s, lo, a0);
             b0 = Vector256.FusedMultiplyAdd(s, hi, b0);
 
-            s = Vector256.Create(Unsafe.Add(ref w, w0 + tokens + step));
+            s = Vector256.Create(Unsafe.Add(ref w, w0 + weightStride + step));
             a1 = Vector256.FusedMultiplyAdd(s, lo, a1);
             b1 = Vector256.FusedMultiplyAdd(s, hi, b1);
 
-            s = Vector256.Create(Unsafe.Add(ref w, w0 + (2 * tokens) + step));
+            s = Vector256.Create(Unsafe.Add(ref w, w0 + (2 * weightStride) + step));
             a2 = Vector256.FusedMultiplyAdd(s, lo, a2);
             b2 = Vector256.FusedMultiplyAdd(s, hi, b2);
 
-            s = Vector256.Create(Unsafe.Add(ref w, w0 + (3 * tokens) + step));
+            s = Vector256.Create(Unsafe.Add(ref w, w0 + (3 * weightStride) + step));
             a3 = Vector256.FusedMultiplyAdd(s, lo, a3);
             b3 = Vector256.FusedMultiplyAdd(s, hi, b3);
         }
 
-        Accumulate(ref y, (row * headDim) + column, a0, b0, width);
-        Accumulate(ref y, ((row + 1) * headDim) + column, a1, b1, width);
-        Accumulate(ref y, ((row + 2) * headDim) + column, a2, b2, width);
-        Accumulate(ref y, ((row + 3) * headDim) + column, a3, b3, width);
+        Accumulate(ref y, (row * resultStride) + column, a0, b0, width);
+        Accumulate(ref y, ((row + 1) * resultStride) + column, a1, b1, width);
+        Accumulate(ref y, ((row + 2) * resultStride) + column, a2, b2, width);
+        Accumulate(ref y, ((row + 3) * resultStride) + column, a3, b3, width);
     }
 
     /// <summary>
@@ -512,8 +529,9 @@ internal static class AttentionKernels
         int column,
         int chunk,
         int steps,
-        int tokens,
-        int headDim,
+        int weightStride,
+        int valueStride,
+        int resultStride,
         int width)
     {
         Vector512<float> a0 = Vector512<float>.Zero, b0 = Vector512<float>.Zero;
@@ -521,12 +539,12 @@ internal static class AttentionKernels
         Vector512<float> a2 = Vector512<float>.Zero, b2 = Vector512<float>.Zero;
         Vector512<float> a3 = Vector512<float>.Zero, b3 = Vector512<float>.Zero;
 
-        int w0 = (row * tokens) + chunk;
-        int vBase = (chunk * headDim) + column;
+        int w0 = (row * weightStride) + chunk;
+        int vBase = (chunk * valueStride) + column;
 
         for (int step = 0; step < steps; step++)
         {
-            int offset = vBase + (step * headDim);
+            int offset = vBase + (step * valueStride);
             Vector512<float> lo = Vector512.LoadUnsafe(ref v, (nuint)offset);
             Vector512<float> hi = Vector512.LoadUnsafe(ref v, (nuint)(offset + width));
 
@@ -534,23 +552,23 @@ internal static class AttentionKernels
             a0 = Vector512.FusedMultiplyAdd(s, lo, a0);
             b0 = Vector512.FusedMultiplyAdd(s, hi, b0);
 
-            s = Vector512.Create(Unsafe.Add(ref w, w0 + tokens + step));
+            s = Vector512.Create(Unsafe.Add(ref w, w0 + weightStride + step));
             a1 = Vector512.FusedMultiplyAdd(s, lo, a1);
             b1 = Vector512.FusedMultiplyAdd(s, hi, b1);
 
-            s = Vector512.Create(Unsafe.Add(ref w, w0 + (2 * tokens) + step));
+            s = Vector512.Create(Unsafe.Add(ref w, w0 + (2 * weightStride) + step));
             a2 = Vector512.FusedMultiplyAdd(s, lo, a2);
             b2 = Vector512.FusedMultiplyAdd(s, hi, b2);
 
-            s = Vector512.Create(Unsafe.Add(ref w, w0 + (3 * tokens) + step));
+            s = Vector512.Create(Unsafe.Add(ref w, w0 + (3 * weightStride) + step));
             a3 = Vector512.FusedMultiplyAdd(s, lo, a3);
             b3 = Vector512.FusedMultiplyAdd(s, hi, b3);
         }
 
-        Accumulate512(ref y, (row * headDim) + column, a0, b0, width);
-        Accumulate512(ref y, ((row + 1) * headDim) + column, a1, b1, width);
-        Accumulate512(ref y, ((row + 2) * headDim) + column, a2, b2, width);
-        Accumulate512(ref y, ((row + 3) * headDim) + column, a3, b3, width);
+        Accumulate512(ref y, (row * resultStride) + column, a0, b0, width);
+        Accumulate512(ref y, ((row + 1) * resultStride) + column, a1, b1, width);
+        Accumulate512(ref y, ((row + 2) * resultStride) + column, a2, b2, width);
+        Accumulate512(ref y, ((row + 3) * resultStride) + column, a3, b3, width);
     }
 
     /// <summary>Four output rows by one column vector, for the columns a wide tile does not cover.</summary>
@@ -563,32 +581,33 @@ internal static class AttentionKernels
         int column,
         int chunk,
         int steps,
-        int tokens,
-        int headDim)
+        int weightStride,
+        int valueStride,
+        int resultStride)
     {
         Vector256<float> a0 = Vector256<float>.Zero, a1 = Vector256<float>.Zero;
         Vector256<float> a2 = Vector256<float>.Zero, a3 = Vector256<float>.Zero;
 
-        int w0 = (row * tokens) + chunk;
-        int vBase = (chunk * headDim) + column;
+        int w0 = (row * weightStride) + chunk;
+        int vBase = (chunk * valueStride) + column;
 
         for (int step = 0; step < steps; step++)
         {
-            Vector256<float> value = Vector256.LoadUnsafe(ref v, (nuint)(vBase + (step * headDim)));
+            Vector256<float> value = Vector256.LoadUnsafe(ref v, (nuint)(vBase + (step * valueStride)));
             a0 = Vector256.FusedMultiplyAdd(
                 Vector256.Create(Unsafe.Add(ref w, w0 + step)), value, a0);
             a1 = Vector256.FusedMultiplyAdd(
-                Vector256.Create(Unsafe.Add(ref w, w0 + tokens + step)), value, a1);
+                Vector256.Create(Unsafe.Add(ref w, w0 + weightStride + step)), value, a1);
             a2 = Vector256.FusedMultiplyAdd(
-                Vector256.Create(Unsafe.Add(ref w, w0 + (2 * tokens) + step)), value, a2);
+                Vector256.Create(Unsafe.Add(ref w, w0 + (2 * weightStride) + step)), value, a2);
             a3 = Vector256.FusedMultiplyAdd(
-                Vector256.Create(Unsafe.Add(ref w, w0 + (3 * tokens) + step)), value, a3);
+                Vector256.Create(Unsafe.Add(ref w, w0 + (3 * weightStride) + step)), value, a3);
         }
 
-        AccumulateOne(ref y, (row * headDim) + column, a0);
-        AccumulateOne(ref y, ((row + 1) * headDim) + column, a1);
-        AccumulateOne(ref y, ((row + 2) * headDim) + column, a2);
-        AccumulateOne(ref y, ((row + 3) * headDim) + column, a3);
+        AccumulateOne(ref y, (row * resultStride) + column, a0);
+        AccumulateOne(ref y, ((row + 1) * resultStride) + column, a1);
+        AccumulateOne(ref y, ((row + 2) * resultStride) + column, a2);
+        AccumulateOne(ref y, ((row + 3) * resultStride) + column, a3);
     }
 
     /// <summary>One output column for up to four rows, scalar.</summary>
@@ -602,21 +621,22 @@ internal static class AttentionKernels
         int column,
         int chunk,
         int steps,
-        int tokens,
-        int headDim)
+        int weightStride,
+        int valueStride,
+        int resultStride)
     {
         for (int r = 0; r < rowCount; r++)
         {
             float sum = 0f;
-            int w0 = ((row + r) * tokens) + chunk;
-            int vBase = (chunk * headDim) + column;
+            int w0 = ((row + r) * weightStride) + chunk;
+            int vBase = (chunk * valueStride) + column;
 
             for (int step = 0; step < steps; step++)
             {
-                sum += Unsafe.Add(ref w, w0 + step) * Unsafe.Add(ref v, vBase + (step * headDim));
+                sum += Unsafe.Add(ref w, w0 + step) * Unsafe.Add(ref v, vBase + (step * valueStride));
             }
 
-            Unsafe.Add(ref y, ((row + r) * headDim) + column) += sum;
+            Unsafe.Add(ref y, ((row + r) * resultStride) + column) += sum;
         }
     }
 
@@ -641,20 +661,23 @@ internal static class AttentionKernels
     /// <summary>Scalar value product, for a machine with no 256-bit vectors.</summary>
     private static void Fallback(
         ReadOnlySpan<float> weights,
+        int weightStride,
         int rows,
         int tokens,
         ReadOnlySpan<float> values,
         int headDim,
-        Span<float> result)
+        int valueStride,
+        Span<float> result,
+        int resultStride)
     {
         for (int row = 0; row < rows; row++)
         {
             for (int token = 0; token < tokens; token++)
             {
-                float weight = weights[(row * tokens) + token];
+                float weight = weights[(row * weightStride) + token];
                 for (int d = 0; d < headDim; d++)
                 {
-                    result[(row * headDim) + d] += weight * values[(token * headDim) + d];
+                    result[(row * resultStride) + d] += weight * values[(token * valueStride) + d];
                 }
             }
         }

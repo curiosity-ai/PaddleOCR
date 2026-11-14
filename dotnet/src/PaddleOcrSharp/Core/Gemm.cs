@@ -101,7 +101,7 @@ public static class Gemm
         ReadOnlyMemory<float> bias,
         Memory<float> y,
         int cols) =>
-        Parallel.For(0, panels, Parallelism.Options, index =>
+        Parallelism.For(panels, index =>
         {
             int start = index * panel;
             RunPanel(
@@ -703,7 +703,7 @@ public static class Gemm
         int rowBlock,
         int columnBlock,
         int columnTiles) =>
-        Parallel.For(0, tiles, Parallelism.Options, tile =>
+        Parallelism.For(tiles, tile =>
             RunTile(tile, a, b, y, m, k, n, transposeB, rowBlock, columnBlock, columnTiles));
 
     /// <summary>Computes one tile of the output.</summary>
