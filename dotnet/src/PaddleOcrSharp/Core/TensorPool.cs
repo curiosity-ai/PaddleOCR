@@ -122,6 +122,20 @@ public static class TensorPool
     internal static float[] RentAlignableArray(int length) =>
         length == 0 ? [] : ArrayPool<float>.Shared.Rent(length + AlignmentSlack);
 
+    /// <summary>
+    /// How many bytes into <paramref name="array"/> the next 64-byte boundary lies; see
+    /// <see cref="AlignmentOffset(float[])"/> for why that matters and what it does not guarantee.
+    /// </summary>
+    /// <param name="array">A rented array with at least 64 spare bytes.</param>
+    internal static unsafe int AlignmentOffset(byte[] array)
+    {
+        nint address = (nint)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(array));
+        return (int)((64 - (address & 63)) & 63);
+    }
+
+    /// <summary>Spare bytes a byte rental carries so its usable region can start on a cache line.</summary>
+    internal const int ByteAlignmentSlack = 64;
+
     /// <summary>Rents a raw byte buffer of at least <paramref name="length"/> bytes.</summary>
     /// <remarks>
     /// For a buffer that has to be read as bytes as well as written as floats — a
