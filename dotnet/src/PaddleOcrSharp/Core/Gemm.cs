@@ -201,9 +201,54 @@ public static class Gemm
             ? stored.Slice(colStart * inner, colCount * inner)
             : scratch;
 
+        // The wide tile reads through raw pointers: with span indexers every one of its eight
+        // loads per step carries a bounds check and its own address arithmetic, which measured
+        // 80 GFLOP/s per thread against 135-142 for the identical tile on pointers (one thread,
+        // panel in L2). It is the same tile with the same per-lane accumulation order, so the
+        // output is bit-identical.
+        bool wide = Simd.Use512 && inner >= Vector512<float>.Count && (inner & (Vector512<float>.Count - 1)) == 0;
+
         Span<float> tile = stackalloc float[16];
 
         int m = 0;
+        if (wide)
+        {
+            unsafe
+            {
+                fixed (float* px = x, pw = w, py = y)
+                {
+                    for (; m <= rows - RowBlock; m += RowBlock)
+                    {
+                        float* xm = px + ((long)m * inner);
+                        float* ym = py + ((long)m * cols) + colStart;
+
+                        int local = 0;
+                        for (; local <= colCount - ColBlock; local += ColBlock)
+                        {
+                            Tile4x4Wide(xm, inner, pw + ((long)local * inner), inner, ym + local, cols);
+                        }
+
+                        for (; local < colCount; local++)
+                        {
+                            ReadOnlySpan<float> wr = w.Slice(local * inner, inner);
+                            for (int r = 0; r < RowBlock; r++)
+                            {
+                                ym[(r * cols) + local] = Dot(x.Slice((m + r) * inner, inner), wr);
+                            }
+                        }
+
+                        if (!bias.IsEmpty)
+                        {
+                            for (int r = 0; r < RowBlock; r++)
+                            {
+                                Kernels.AddInPlace(y.Slice(((m + r) * cols) + colStart, colCount), bias[colStart..colEnd]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (; m <= rows - RowBlock; m += RowBlock)
         {
             ReadOnlySpan<float> x0 = x.Slice(m * inner, inner);
@@ -291,6 +336,90 @@ public static class Gemm
                 Kernels.AddInPlace(yr[colStart..colEnd], bias[colStart..colEnd]);
             }
         }
+    }
+
+    /// <summary>
+    /// The 512-bit four-by-four tile on raw pointers: sixteen dot products accumulated one lane
+    /// per output across the whole reduction, then reduced, exactly as <see cref="Dot4x4"/> does.
+    /// </summary>
+    /// <param name="x">First of four consecutive activation rows.</param>
+    /// <param name="xStride">Distance between activation rows.</param>
+    /// <param name="w">First of four consecutive widened weight rows.</param>
+    /// <param name="wStride">Distance between weight rows.</param>
+    /// <param name="y">Output element for row 0, column 0 of the tile.</param>
+    /// <param name="yStride">Distance between output rows.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void Tile4x4Wide(float* x, int xStride, float* w, int wStride, float* y, int yStride)
+    {
+        float* x0 = x;
+        float* x1 = x + xStride;
+        float* x2 = x + (2L * xStride);
+        float* x3 = x + (3L * xStride);
+        float* w0p = w;
+        float* w1p = w + wStride;
+        float* w2p = w + (2L * wStride);
+        float* w3p = w + (3L * wStride);
+
+        Vector512<float> a00 = Vector512<float>.Zero, a01 = Vector512<float>.Zero;
+        Vector512<float> a02 = Vector512<float>.Zero, a03 = Vector512<float>.Zero;
+        Vector512<float> a10 = Vector512<float>.Zero, a11 = Vector512<float>.Zero;
+        Vector512<float> a12 = Vector512<float>.Zero, a13 = Vector512<float>.Zero;
+        Vector512<float> a20 = Vector512<float>.Zero, a21 = Vector512<float>.Zero;
+        Vector512<float> a22 = Vector512<float>.Zero, a23 = Vector512<float>.Zero;
+        Vector512<float> a30 = Vector512<float>.Zero, a31 = Vector512<float>.Zero;
+        Vector512<float> a32 = Vector512<float>.Zero, a33 = Vector512<float>.Zero;
+
+        for (int i = 0; i < xStride; i += Vector512<float>.Count)
+        {
+            Vector512<float> w0 = Vector512.Load(w0p + i);
+            Vector512<float> w1 = Vector512.Load(w1p + i);
+            Vector512<float> w2 = Vector512.Load(w2p + i);
+            Vector512<float> w3 = Vector512.Load(w3p + i);
+
+            Vector512<float> v = Vector512.Load(x0 + i);
+            a00 = Vector512.FusedMultiplyAdd(v, w0, a00);
+            a01 = Vector512.FusedMultiplyAdd(v, w1, a01);
+            a02 = Vector512.FusedMultiplyAdd(v, w2, a02);
+            a03 = Vector512.FusedMultiplyAdd(v, w3, a03);
+
+            v = Vector512.Load(x1 + i);
+            a10 = Vector512.FusedMultiplyAdd(v, w0, a10);
+            a11 = Vector512.FusedMultiplyAdd(v, w1, a11);
+            a12 = Vector512.FusedMultiplyAdd(v, w2, a12);
+            a13 = Vector512.FusedMultiplyAdd(v, w3, a13);
+
+            v = Vector512.Load(x2 + i);
+            a20 = Vector512.FusedMultiplyAdd(v, w0, a20);
+            a21 = Vector512.FusedMultiplyAdd(v, w1, a21);
+            a22 = Vector512.FusedMultiplyAdd(v, w2, a22);
+            a23 = Vector512.FusedMultiplyAdd(v, w3, a23);
+
+            v = Vector512.Load(x3 + i);
+            a30 = Vector512.FusedMultiplyAdd(v, w0, a30);
+            a31 = Vector512.FusedMultiplyAdd(v, w1, a31);
+            a32 = Vector512.FusedMultiplyAdd(v, w2, a32);
+            a33 = Vector512.FusedMultiplyAdd(v, w3, a33);
+        }
+
+        y[0] = Vector512.Sum(a00);
+        y[1] = Vector512.Sum(a01);
+        y[2] = Vector512.Sum(a02);
+        y[3] = Vector512.Sum(a03);
+        y += yStride;
+        y[0] = Vector512.Sum(a10);
+        y[1] = Vector512.Sum(a11);
+        y[2] = Vector512.Sum(a12);
+        y[3] = Vector512.Sum(a13);
+        y += yStride;
+        y[0] = Vector512.Sum(a20);
+        y[1] = Vector512.Sum(a21);
+        y[2] = Vector512.Sum(a22);
+        y[3] = Vector512.Sum(a23);
+        y += yStride;
+        y[0] = Vector512.Sum(a30);
+        y[1] = Vector512.Sum(a31);
+        y[2] = Vector512.Sum(a32);
+        y[3] = Vector512.Sum(a33);
     }
 
     /// <summary>
