@@ -94,6 +94,180 @@ public static class Gemm
         RunPanelsInParallel(panels, panel, x, rows, inner, weight, bias, y, cols);
     }
 
+    /// <summary>One projection of an input shared with others: its weight, bias and destination.</summary>
+    public readonly struct LinearPart
+    {
+        /// <summary>Describes one projection.</summary>
+        /// <param name="weight">Weight, <c>[cols, inner]</c>.</param>
+        /// <param name="bias">Optional bias of length <c>cols</c>; empty for none.</param>
+        /// <param name="output">Receives <c>[rows, cols]</c>.</param>
+        public LinearPart(WeightMatrix weight, ReadOnlyMemory<float> bias, Memory<float> output)
+        {
+            Weight = weight;
+            Bias = bias;
+            Output = output;
+        }
+
+        /// <summary>The weight, <c>[cols, inner]</c>.</summary>
+        public WeightMatrix Weight { get; }
+
+        /// <summary>The bias, or empty.</summary>
+        public ReadOnlyMemory<float> Bias { get; }
+
+        /// <summary>The destination, <c>[rows, cols]</c>.</summary>
+        public Memory<float> Output { get; }
+
+        /// <summary>Output columns.</summary>
+        public int Cols => Weight.Rows;
+    }
+
+    /// <summary>
+    /// Several projections of one input — a layer's query, key and value, or its gate and up —
+    /// computed together: <c>parts[i].Output = x · parts[i].Weightᵀ + parts[i].Bias</c>.
+    /// </summary>
+    /// <remarks>
+    /// Each output is exactly what <see cref="Linear"/> would give it, bit for bit, in either accumulation order. What is shared is the work around
+    /// them: the outer-product form packs the activations once rather than once per projection
+    /// (4-5% of the GEMM time of a tower pass, three times over for q, k and v), and all the
+    /// projections' column panels run in one parallel region rather than one each, so a decode
+    /// step has one region boundary where it had three.
+    /// </remarks>
+    /// <param name="x">Activations, <c>[rows, inner]</c>.</param>
+    /// <param name="rows">Number of activation rows.</param>
+    /// <param name="inner">Shared reduction length.</param>
+    /// <param name="parts">The projections; their weights may differ in width.</param>
+    public static void LinearMany(ReadOnlyMemory<float> x, int rows, int inner, LinearPart[] parts)
+    {
+        ArgumentNullException.ThrowIfNull(parts);
+
+        long work = 0;
+        foreach (LinearPart part in parts)
+        {
+            ValidateLinear(x, rows, inner, part.Weight, part.Bias, part.Output, part.Cols);
+            work += (long)rows * part.Cols * inner;
+        }
+
+        if (parts.Length == 1)
+        {
+            Linear(x, rows, inner, parts[0].Weight, parts[0].Bias, parts[0].Output, parts[0].Cols);
+            return;
+        }
+
+        if (work < ParallelThreshold || Environment.ProcessorCount <= 1)
+        {
+            foreach (LinearPart part in parts)
+            {
+                RunPanel(x.Span, rows, inner, part.Weight, part.Bias.Span, part.Output.Span, part.Cols, 0, part.Cols);
+            }
+
+            return;
+        }
+
+        if (GemmOuter.Applies(rows))
+        {
+            GemmOuter.LinearMany(x, rows, inner, parts);
+            return;
+        }
+
+        PanelPlan plan = PanelPlan.Create(parts, inner);
+        RunPartsInParallel(plan, x, rows, inner);
+    }
+
+    // Kept out of the method above for the usual reason: a method that contains a lambda allocates
+    // its display class on entry, whichever branch runs.
+    private static void RunPartsInParallel(PanelPlan plan, ReadOnlyMemory<float> x, int rows, int inner) =>
+        Parallelism.For(plan.Total, index =>
+        {
+            (int part, int start, int count) = plan.Locate(index);
+            LinearPart p = plan.Parts[part];
+            RunPanel(x.Span, rows, inner, p.Weight, p.Bias.Span, p.Output.Span, p.Cols, start, count);
+        });
+
+    /// <summary>
+    /// The column panels of several projections as one numbered list, so a single parallel region
+    /// can claim them in turn.
+    /// </summary>
+    internal sealed class PanelPlan
+    {
+        private readonly int[] _widths;
+        private readonly int[] _first;
+
+        private PanelPlan(LinearPart[] parts, int[] widths, int[] first, int total)
+        {
+            Parts = parts;
+            _widths = widths;
+            _first = first;
+            Total = total;
+        }
+
+        /// <summary>The projections.</summary>
+        internal LinearPart[] Parts { get; }
+
+        /// <summary>Number of panels over every projection.</summary>
+        internal int Total { get; }
+
+        /// <summary>Builds the plan, each projection's panels sized as <see cref="ChoosePanelWidth"/> sizes them alone.</summary>
+        internal static PanelPlan Create(LinearPart[] parts, int inner)
+        {
+            int[] widths = new int[parts.Length];
+            int[] first = new int[parts.Length];
+            int total = 0;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                widths[i] = ChoosePanelWidth(inner, parts[i].Cols, parts[i].Weight.Dtype);
+                first[i] = total;
+                total += (parts[i].Cols + widths[i] - 1) / widths[i];
+            }
+
+            return new PanelPlan(parts, widths, first, total);
+        }
+
+        /// <summary>The projection, first column and column count of panel <paramref name="index"/>.</summary>
+        internal (int Part, int Start, int Count) Locate(int index)
+        {
+            int part = 0;
+            while (part + 1 < _first.Length && index >= _first[part + 1])
+            {
+                part++;
+            }
+
+            int start = (index - _first[part]) * _widths[part];
+            return (part, start, Math.Min(_widths[part], Parts[part].Cols - start));
+        }
+    }
+
+    private static void ValidateLinear(
+        ReadOnlyMemory<float> x,
+        int rows,
+        int inner,
+        WeightMatrix weight,
+        ReadOnlyMemory<float> bias,
+        Memory<float> y,
+        int cols)
+    {
+        if (weight.Rows != cols || weight.Cols != inner)
+        {
+            throw new ArgumentException(
+                $"Weight is [{weight.Rows}, {weight.Cols}] but the call needs [{cols}, {inner}].",
+                nameof(weight));
+        }
+
+        if (x.Length < (long)rows * inner)
+        {
+            throw new ArgumentException("Activation buffer is too small.", nameof(x));
+        }
+
+        if (y.Length < (long)rows * cols)
+        {
+            throw new ArgumentException("Output buffer is too small.", nameof(y));
+        }
+
+        if (!bias.IsEmpty && bias.Length < cols)
+        {
+            throw new ArgumentException("Bias buffer is too small.", nameof(bias));
+        }
+    }
+
     /// <summary>
     /// Runs the column panels concurrently, kept out of <see cref="Linear"/> for the same reason
     /// as <see cref="RunTilesInParallel"/>: a method holding a lambda pays for it on entry, and

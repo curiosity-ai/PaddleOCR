@@ -85,15 +85,25 @@ internal static class GemmOuter
         WeightMatrix weight,
         ReadOnlyMemory<float> bias,
         Memory<float> y,
-        int cols)
+        int cols) =>
+        LinearMany(x, rows, inner, [new Gemm.LinearPart(weight, bias, y)]);
+
+    /// <summary>
+    /// Several projections of one activation matrix: packed once, every projection's panels run in
+    /// one parallel region.
+    /// </summary>
+    /// <param name="x">Activations, <c>[rows, inner]</c>.</param>
+    /// <param name="rows">Number of activation rows.</param>
+    /// <param name="inner">Reduction length.</param>
+    /// <param name="parts">The projections.</param>
+    internal static void LinearMany(ReadOnlyMemory<float> x, int rows, int inner, Gemm.LinearPart[] parts)
     {
         int groups = (rows + GroupRows - 1) / GroupRows;
         using PooledBuffer packed = TensorPool.Rent(checked(groups * GroupRows * inner));
         PackAll(x, rows, inner, groups, packed.Memory);
 
-        int panel = Gemm.ChoosePanelWidth(inner, cols, weight.Dtype);
-        int panels = (cols + panel - 1) / panel;
-        RunPanels(panels, panel, packed.Memory, groups, rows, inner, weight, bias, y, cols);
+        Gemm.PanelPlan plan = Gemm.PanelPlan.Create(parts, inner);
+        RunPanels(plan, packed.Memory, groups, rows, inner);
     }
 
     // The lambdas live in their own methods: a method that contains one allocates its display
@@ -101,22 +111,12 @@ internal static class GemmOuter
     private static void PackAll(ReadOnlyMemory<float> x, int rows, int inner, int groups, Memory<float> packed) =>
         Parallelism.For(groups, group => PackGroup(x.Span, rows, inner, group, packed.Span));
 
-    private static void RunPanels(
-        int panels,
-        int panel,
-        ReadOnlyMemory<float> packed,
-        int groups,
-        int rows,
-        int inner,
-        WeightMatrix weight,
-        ReadOnlyMemory<float> bias,
-        Memory<float> y,
-        int cols) =>
-        Parallelism.For(panels, index =>
+    private static void RunPanels(Gemm.PanelPlan plan, ReadOnlyMemory<float> packed, int groups, int rows, int inner) =>
+        Parallelism.For(plan.Total, index =>
         {
-            int start = index * panel;
-            RunPanel(
-                packed.Span, groups, rows, inner, weight, bias.Span, y.Span, cols, start, Math.Min(panel, cols - start));
+            (int part, int start, int count) = plan.Locate(index);
+            Gemm.LinearPart p = plan.Parts[part];
+            RunPanel(packed.Span, groups, rows, inner, p.Weight, p.Bias.Span, p.Output.Span, p.Cols, start, count);
         });
 
     /// <summary>

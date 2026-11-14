@@ -147,9 +147,15 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("qkv gemm"))
             {
-                Gemm.Linear(normed.Memory, tokenCount, width, layer.Query, default, queries.Memory, queryWidth);
-                Gemm.Linear(normed.Memory, tokenCount, width, layer.Key, default, keys.Memory, keyValueWidth);
-                Gemm.Linear(normed.Memory, tokenCount, width, layer.Value, default, values.Memory, keyValueWidth);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    tokenCount,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Query, default, queries.Memory),
+                        new Gemm.LinearPart(layer.Key, default, keys.Memory),
+                        new Gemm.LinearPart(layer.Value, default, values.Memory),
+                    ]);
             }
 
             using (profile?.Measure("rope"))
@@ -197,10 +203,14 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("mlp gemm"))
             {
-                Gemm.Linear(
-                    normed.Memory, tokenCount, width, layer.Gate, default, gate.Memory, _config.IntermediateSize);
-                Gemm.Linear(
-                    normed.Memory, tokenCount, width, layer.Up, default, up.Memory, _config.IntermediateSize);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    tokenCount,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Gate, default, gate.Memory),
+                        new Gemm.LinearPart(layer.Up, default, up.Memory),
+                    ]);
             }
 
             using (profile?.Measure("silu"))
@@ -319,9 +329,15 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("qkv gemm"))
             {
-                Gemm.Linear(normed.Memory, batch, width, layer.Query, default, queries.Memory, queryWidth);
-                Gemm.Linear(normed.Memory, batch, width, layer.Key, default, keys.Memory, keyValueWidth);
-                Gemm.Linear(normed.Memory, batch, width, layer.Value, default, values.Memory, keyValueWidth);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    batch,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Query, default, queries.Memory),
+                        new Gemm.LinearPart(layer.Key, default, keys.Memory),
+                        new Gemm.LinearPart(layer.Value, default, values.Memory),
+                    ]);
             }
 
             using (profile?.Measure("rope"))
@@ -372,8 +388,14 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("mlp gemm"))
             {
-                Gemm.Linear(normed.Memory, batch, width, layer.Gate, default, gate.Memory, _config.IntermediateSize);
-                Gemm.Linear(normed.Memory, batch, width, layer.Up, default, up.Memory, _config.IntermediateSize);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    batch,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Gate, default, gate.Memory),
+                        new Gemm.LinearPart(layer.Up, default, up.Memory),
+                    ]);
             }
 
             using (profile?.Measure("silu"))

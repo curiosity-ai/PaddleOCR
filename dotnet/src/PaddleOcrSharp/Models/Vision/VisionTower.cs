@@ -163,6 +163,8 @@ public sealed class VisionTower
         using PooledBuffer values = TensorPool.Rent(heads * tokens * rowStride);
         using PooledBuffer attention = TensorPool.Rent(heads * tokens * rowStride);
         using PooledBuffer packed = TensorPool.Rent(tokens * width);
+        using PooledBuffer packedKeys = TensorPool.Rent(tokens * width);
+        using PooledBuffer packedValues = TensorPool.Rent(tokens * width);
         using PooledBuffer intermediate = TensorPool.Rent(tokens * _config.IntermediateSize);
 
         float scale = 1f / MathF.Sqrt(headDim);
@@ -177,34 +179,26 @@ public sealed class VisionTower
                 Norms.LayerNormParallel(normed.Memory, width, layer.Norm1Weight, layer.Norm1Bias, _config.LayerNormEps);
             }
 
+            // One call for the three projections: the activations are packed once, and the three
+            // sets of column panels run in one parallel region.
             using (profile?.Measure("qkv gemm"))
             {
-                Gemm.Linear(normed.Memory, tokens, width, layer.Query, layer.QueryBias, packed.Memory, width);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    tokens,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Query, layer.QueryBias, packed.Memory),
+                        new Gemm.LinearPart(layer.Key, layer.KeyBias, packedKeys.Memory),
+                        new Gemm.LinearPart(layer.Value, layer.ValueBias, packedValues.Memory),
+                    ]);
             }
 
             using (profile?.Measure("rope+split"))
             {
                 SplitHeadsWithRope(packed.Memory, queries.Memory, tokens, heads, headDim, cos.Memory, sin.Memory);
-            }
-
-            using (profile?.Measure("qkv gemm"))
-            {
-                Gemm.Linear(normed.Memory, tokens, width, layer.Key, layer.KeyBias, packed.Memory, width);
-            }
-
-            using (profile?.Measure("rope+split"))
-            {
-                SplitHeadsWithRope(packed.Memory, keys.Memory, tokens, heads, headDim, cos.Memory, sin.Memory);
-            }
-
-            using (profile?.Measure("qkv gemm"))
-            {
-                Gemm.Linear(normed.Memory, tokens, width, layer.Value, layer.ValueBias, packed.Memory, width);
-            }
-
-            using (profile?.Measure("rope+split"))
-            {
-                SplitHeads(packed.Memory, values.Memory, tokens, heads, headDim, rowStride);
+                SplitHeadsWithRope(packedKeys.Memory, keys.Memory, tokens, heads, headDim, cos.Memory, sin.Memory);
+                SplitHeads(packedValues.Memory, values.Memory, tokens, heads, headDim, rowStride);
             }
 
             using (profile?.Measure("attention"))
