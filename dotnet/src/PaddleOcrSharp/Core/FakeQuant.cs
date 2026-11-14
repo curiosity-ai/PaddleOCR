@@ -15,6 +15,14 @@ internal static class FakeQuant
     internal static readonly int ActivationBits =
         int.TryParse(Environment.GetEnvironmentVariable("PADDLEOCR_SHARP_FAKE_A_BITS"), out int bits) ? bits : 0;
 
+    /// <summary>
+    /// Products with fewer rows than this are left alone (default 32), because an integer-activation
+    /// kernel would only be used where the product is bound by arithmetic: the tower, the projector
+    /// and the prompt's prefill. A decode step is bound by bytes, and stays weight-only.
+    /// </summary>
+    internal static readonly int MinRows =
+        int.TryParse(Environment.GetEnvironmentVariable("PADDLEOCR_SHARP_FAKE_A_MINROWS"), out int rows) ? rows : 32;
+
     /// <summary>Returns a quantised copy of <paramref name="x"/>, row by row.</summary>
     internal static PooledBuffer Activations(ReadOnlySpan<float> x, int rows, int inner)
     {

@@ -70,7 +70,7 @@ public static class Gemm
             throw new ArgumentException("Bias buffer is too small.", nameof(bias));
         }
 
-        if (FakeQuant.ActivationBits != 0 && weight.FromCheckpoint)
+        if (FakeQuant.ActivationBits != 0 && rows >= FakeQuant.MinRows && weight.FromCheckpoint)
         {
             using PooledBuffer quantised = FakeQuant.Activations(x.Span, rows, inner);
             LinearCore(quantised.Memory, rows, inner, weight, bias, y, cols);
@@ -172,7 +172,7 @@ public static class Gemm
             return;
         }
 
-        if (FakeQuant.ActivationBits != 0 && parts[0].Weight.FromCheckpoint)
+        if (FakeQuant.ActivationBits != 0 && rows >= FakeQuant.MinRows && parts[0].Weight.FromCheckpoint)
         {
             using PooledBuffer quantised = FakeQuant.Activations(x.Span, rows, inner);
             LinearManyCore(quantised.Memory, rows, inner, parts, work);
