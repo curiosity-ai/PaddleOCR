@@ -38,3 +38,20 @@ layout stage). The markdown is byte-identical (`md5 5cfc8ef5`) on all twelve run
 | 150 | after | 23.5 / 23.3 / 23.0 | 13.2-13.5 | 2.4-2.5 | 4.5-4.8 | 2.6-2.7 |
 
 What changed and why is in `CLAUDE.md`, under "Alignment and the worker team".
+
+## The outer-product GEMM, accuracy at every resolution
+
+`PADDLEOCR_SHARP_GEMM=outer` against the default dot form, same page, same binary. The markdown is
+byte-identical at all fifteen resolutions, so every column below is the same for both:
+
+| dpi | text CER | word recall | table cells |
+|---|---|---|---|
+| 20 | 73.52% | 17.2% | 0/28 |
+| 25 | 22.61% | 60.4% | 11/28 |
+| 30 | 16.93% | 70.9% | 10/28 |
+| 35 | 2.84% | 92.5% | 17/28 |
+| 40 | 0.11% | 99.3% | 28/28 |
+| 45 - 400 | 0.00% | 100.0% | 28/28 |
+
+Vision-tower embeddings, dot against outer (relative L2 / worst per-token cosine): text block
+3.9e-6 / 0.999999998, table block 5.1e-5 / 0.9999992, title block 4.7e-6 / 1.000000000.

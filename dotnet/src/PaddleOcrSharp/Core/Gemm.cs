@@ -76,6 +76,14 @@ public static class Gemm
             return;
         }
 
+        // Many rows go to the outer-product form, which has no final lane reductions and so runs
+        // the same arithmetic faster; it is not bit-identical to the dot form below, see GemmOuter.
+        if (GemmOuter.Applies(rows))
+        {
+            GemmOuter.Linear(x, rows, inner, weight, bias, y, cols);
+            return;
+        }
+
         // Split along the output columns, not the rows: a thread that owns a column panel walks
         // the same slice of the weight matrix for every activation row, so the panel stays in
         // cache. Splitting along rows would make every thread stream the whole weight matrix once
@@ -121,7 +129,7 @@ public static class Gemm
     /// multiple of four that the tail costs nothing. Rounding the count up rather than the width
     /// down keeps every panel inside L2 and gives each worker the same number of them.
     /// </remarks>
-    private static int ChoosePanelWidth(int inner, int cols, DType dtype)
+    internal static int ChoosePanelWidth(int inner, int cols, DType dtype)
     {
         const int TargetPanelBytes = 256 * 1024;
 

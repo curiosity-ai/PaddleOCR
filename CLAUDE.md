@@ -1013,6 +1013,45 @@ score rows to a multiple of sixteen floats, and the per-head value and output ro
 lines where 72 floats is four and a half), took the score kernel 5-10% and the value kernel nothing,
 bit-identically. Attention is 21% of the tower, so that is 1-2% of it; it stays because it is free.
 
+**5. The outer-product tile, built and left opt-in (`PADDLEOCR_SHARP_GEMM=outer`).** The one change
+here that is not bit-identical, so it was built and measured separately. Lanes run along activation
+rows instead of along the reduction: activations are packed once per call into `[k][32]` groups
+(the last zero-padded), weights stay in the row-major panel and are read by broadcast, and a tile of
+thirty-two rows by eight columns keeps sixteen independent chains with nothing to reduce afterwards.
+Reductions longer than 1152 are cut into chunks with the accumulators carried through memory, which
+is the same sequential chain resumed; without that the two large-reduction shapes gained 2% and 7%
+where the others gained 22%, because four 551 KB row groups no longer fit L2. Carrying the resume
+as a flag on the hot kernel cost the JIT its register allocation (a 520 GFLOP/s kernel measured
+280), so resuming is a separate copy of each kernel.
+
+| | dot form | outer form | |
+| --- | --- | --- | --- |
+| tower qkv / proj, 1368 rows | 428 | 477 GFLOP/s | 1.11x |
+| tower MLP up | 435 | 518 | 1.19x |
+| tower MLP down (K 4304) | 349 | 405 | 1.16x |
+| projector (K 4608) | 333 | 422 | 1.27x |
+| prefill qkv / MLP | 403 / 404 | 474 / 481 | 1.18-1.19x |
+
+Medians of five interleaved rounds, spread 2-5%. What it is worth on a page is much less, because
+the GEMMs are about two thirds of the tower and the tower is a bit over half of the page: 150 dpi
+21.8 -> 20.7 s (mean of three interleaved runs; best 21.4 -> 20.1 s), 100 dpi within noise, vision
+12.3 -> 11.6 s, layout convolutions 957-1103 -> 862-959 ms. A projection of 10% for the whole page,
+made from the isolated kernel, came out at about half that.
+
+**Accuracy, which is the reason it is opt-in and not the reason to doubt it.** Per product, a
+sequential float32 chain has 2.3-2.5x the rounding error of the dot form against a float64
+reference (mean relative error 1.7e-6 against 7.5e-7 at a reduction of 1152, 3.7e-6 against 1.5e-6
+at 4304); the two orders' results differ in the low bits of 95-98% of outputs. After 27 layers and
+the projector the vision embeddings differ by a relative L2 of 4.0e-6 and 4.7e-6 (a text and a title
+block) and 5.1e-5 (a table block), worst per-token cosine similarity 0.9999992. And on the synthetic
+A4 page at fifteen resolutions from 20 to 400 dpi, **the markdown is byte-identical to the dot
+form's at every one**, including 20-35 dpi where the recognised text is wrong (CER 73.5% down to 2.8%)
+and greedy decoding has the least margin to spare: text CER, word recall and table cells match to the
+digit at all fifteen (`tools/dpi_study/REPORT.md`). That is one document, a few hundred tokens a
+resolution, and decode still runs the dot form (it has fewer than 32 rows); the corpus is what
+would move this from opt-in to default, and `GemmOuterTests` pins the accuracy per product against a
+float64 reference in the meantime.
+
 What is left, at 150 dpi: the tower's GEMMs are at 410-420 GFLOP/s (48% of peak, 86% of what the
 bare tile does on four threads), decode is at 20 ms a step against a 14 ms streaming floor, and a
 cold layout detection is 0.7 s slower than a warm one (JIT with tiering off, and 811 MiB of arena
@@ -1120,13 +1159,10 @@ comment, and the two cold-start answers that did not work — and the generalise
   GEMM variant measured slower than the 256-bit kernel, including a narrowed tile chosen to fit
   the register file. See `Core/Simd.cs`; the override is left to whoever measures their own
   machine.
-- **An outer-product GEMM tile (lanes are output columns, no lane reductions).** On a packed
-  `[k][32]` panel, eight rows by thirty-two columns held in sixteen `zmm`, it measured 172-177
-  GFLOP/s a thread against 137 for the dot-form tile: +27% on the kernel, which would be about 10% of
-  a page. Not taken, because each output then accumulates in one sequential chain instead of sixteen
-  lane chains and a final reduction, so the floats differ from every earlier build's and the
-  byte-identity bar is gone for a gain that is real but modest. It is the next thing to try if that
-  bar is ever relaxed deliberately; the prototype is a page of code.
+- **An outer-product GEMM tile, as the default.** Built and measured (item 5 above), and shipped
+  opt-in rather than on: the GEMMs gain 11-27% but a page only 2-6%, and the project's bar is
+  byte-identical output checked over a corpus that was not to hand. Turning it on is the one-line
+  change to `GemmOuter.Enabled`.
 - **Taller tiles, a 64-bit loop index and a 2x unroll for the dot-form tile.** 6x4 and 8x2 measured
   136-137 against 136-142 for 4x4 (same accumulation order, so they would have been bit-identical);
   a `nint` index with the loop unrolled twice measured 138. The tile is not loop-overhead-bound.
