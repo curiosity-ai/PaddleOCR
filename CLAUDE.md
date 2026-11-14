@@ -1160,9 +1160,9 @@ contiguous reduction vector the tile wants — so nothing is widened or repacked
 quantised once per call (once for q, k and v together), shifted to unsigned for the instruction,
 and the shift is undone with each weight row's sum, computed once per matrix. The scale must be one
 per row: a grouped scale needs a conversion and a multiply-add every 128 weights, about half the
-gain. AMX and AVX-512 VNNI are not exposed by .NET 10 (the version this was measured on; not re-checked on 11) (`AvxVnni`, the 256-bit form, is), so this
+gain. AMX is not exposed by .NET, and the 512-bit form of the instruction was not exposed by .NET 10 (`AvxVnni`, the 256-bit form, was), so this
 runs at 256 bits; without `AvxVnni` it is weights-only and its output can differ slightly from a
-machine that has it.
+machine that has it. **.NET 11 does expose the 512-bit form** — see "What .NET 11 adds" below.
 
 **What it costs in recognition**, against the bf16 output of the same ten pages:
 
@@ -1199,6 +1199,43 @@ Python quantiser and the library's on-the-fly one are the same arithmetic in flo
 experiment tooling that produced the table is in the same directory: `make_variant.py` (an exact
 quantise-then-dequantise float32 checkpoint of any scheme), `score_variants.py`, and the
 `PADDLEOCR_SHARP_FAKE_A_BITS` hook, which emulates per-token integer activations without a kernel.
+
+### What .NET 11 adds, and the one thing in it that matters here
+
+The port moved to .NET 11 (see the project layout). Enumerating every `System.Runtime.Intrinsics.X86`
+type in both runtimes on this machine (a Xeon with `avx512_vnni`, `avx512_bf16`, `avx512_fp16` and
+AMX in `/proc/cpuinfo`) shows **one new class and one new nested class**:
+
+| New in .NET 11 | Supported here | Use |
+| --- | --- | --- |
+| `AvxVnni.V512` — `vpdpbusd` / `vpdpwssd` on `Vector512` | **yes** | the int8 GEMM tile, at twice its width |
+| `Avx512Bmm` — bit matrix multiply | no | none |
+| `System.Numerics.BFloat16` | n/a | scalar conversions only; no vector operations |
+
+Still not exposed, though the CPU has them: **AMX** (no type in either runtime), **AVX-512 BF16**
+(`vdpbf16ps`) and **AVX-512 FP16** (reachable only through `Avx10v1`, which this CPU lacks).
+`AvxVnniInt8` / `AvxVnniInt16` exist in both and are unsupported here; they would remove the
+unsigned shift the int8 path applies to its activations, on a CPU that has them.
+
+`tools/vnni` measures what the 512-bit instruction is worth, against the 256-bit one the kernels use
+(five rounds, best of three each; rates count int8 multiply-adds):
+
+| | 256-bit | 512-bit | |
+| --- | --- | --- | --- |
+| pure throughput, twelve chains | 190-215 GMAC/s | 312-367 GMAC/s | 1.6-1.9x |
+| a 4x4 tile like `GemmInt8`'s, in L1 | 177-184 GMAC/s | 249-255 GMAC/s | **1.39-1.56x** |
+
+The tile is the number that transfers: 1.4x on the arithmetic of the int8 products, against the 3.1x
+the 256-bit tile already gave over the float32 one. What that is worth on a page is bounded by how
+much of it is those products: at a 1156-patch block, GEMM is about half of the tower (MLP 952 ms,
+qkv 369, output 168 of a pass of roughly 2.9 s) and at a 4900-patch block it is 21%, so **an
+estimated 5-10% of vision at ordinary block sizes and 4-6% at the largest, before the work that does
+not scale with the vector width** (quantising the activations, the row sums, the final reductions).
+That is an estimate from the isolated tile, not a measurement of the kernel, and the isolated tile
+over-promised before (item 5 under "Alignment and the worker team": 19% on the tile, 10% in place).
+Two constraints on building it: a 512-bit reduction vector is 64 bytes, and the MLP's second
+projection reduces over 4304, which is 67.25 of them, so that product needs a 256-bit tail; and the
+256-bit kernel stays for machines without `AvxVnni.V512`.
 
 ### Attention at large blocks: what a 4900-patch block was spending
 
