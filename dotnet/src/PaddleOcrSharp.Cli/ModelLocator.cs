@@ -42,7 +42,7 @@ public static class ModelLocator
     }
 
     /// <summary>
-    /// Reads how the language model's weights should be held: <c>--quantization none|int8</c>, or the
+    /// Reads how the language model's weights should be held: <c>--quantization none|int8|int8-compute</c>, or the
     /// <c>PADDLEOCR_SHARP_QUANTIZATION</c> environment variable, or none.
     /// </summary>
     public static WeightQuantization QuantizationFrom(CommandLine command)
@@ -58,7 +58,12 @@ public static class ModelLocator
             return WeightQuantization.Int8;
         }
 
-        throw new ArgumentException($"Unknown quantization '{text}'. Use none or int8.");
+        if (text.Equals("int8-compute", StringComparison.OrdinalIgnoreCase))
+        {
+            return WeightQuantization.Int8Compute;
+        }
+
+        throw new ArgumentException($"Unknown quantization '{text}'. Use none, int8 or int8-compute.");
     }
 
     /// <summary>

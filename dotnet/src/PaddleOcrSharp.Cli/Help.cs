@@ -57,13 +57,17 @@ public static class Help
                                       core). Independent of --block-concurrency, which decides how
                                       many blocks run at once; the two multiply. -1 removes the cap,
                                       which is slower here — see CLAUDE.md.
-              --quantization none|int8
-                          How the language model's weights are held (default: none).
-                          int8 keeps the decoder's projections and output head as bytes
-                          with a scale per 128 weights, which halves what a decode step
-                          streams. Nothing is calibrated; formulas can change in small
-                          ways. A checkpoint already quantised on disk is read as it is
-                          stored. PADDLEOCR_SHARP_QUANTIZATION sets the default.
+              --quantization none|int8|int8-compute
+                          How the model's weights are held (default: none). Nothing is
+                          calibrated; formulas can change in small ways.
+                          int8: the decoder's projections and output head are bytes with a
+                          scale per 128 weights, which halves what a decode step streams.
+                          int8-compute: also the vision tower and projector, one scale per
+                          row, and products with 32 rows or more quantise their activations
+                          too and use the integer dot-product instruction (AVX-VNNI),
+                          about three times the float32 rate; without AVX-VNNI it is
+                          weights-only. A checkpoint already quantised on disk is read as
+                          it is stored. PADDLEOCR_SHARP_QUANTIZATION sets the default.
               --max-new-tokens <n>    Token budget per block (default: 8192)
               --stop-on-repetition <bool>
                                       Stop a block once its output has fallen into a verbatim
