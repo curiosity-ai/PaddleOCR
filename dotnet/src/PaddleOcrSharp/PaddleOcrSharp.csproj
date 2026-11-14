@@ -24,8 +24,7 @@
   <ItemGroup>
     <PackageReference Include="SkiaSharp" Version="3.119.0" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.119.0" />
-    <PackageReference Include="System.Numerics.Tensors" Version="10.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageReference Include="System.Numerics.Tensors" Version="11.0.0" />
   </ItemGroup>
 
 </Project>

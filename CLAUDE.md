@@ -107,7 +107,7 @@ from another tensor's shape at run time arrives), or a scale; UVDoc uses the lis
 ```
 dotnet/
   PaddleOcrSharp.slnx
-  Directory.Build.props        # net10.0, unsafe, nullable, preview lang, package metadata
+  Directory.Build.props        # net11.0, unsafe, nullable, preview lang, package metadata
   Directory.Build.targets      # attaches the repository README to the packable projects
   src/
     PaddleOcrSharp/            # the library — everything below is here
@@ -149,7 +149,7 @@ SkiaSharp's resampler matches neither and is used only for decoding and encoding
 
 ## Engineering conventions
 
-- **.NET 10 / C# preview.** Use `System.Numerics.Tensors`, `Vector<T>` / `Vector512<T>`,
+- **.NET 11 / C# preview.** Use `System.Numerics.Tensors`, `Vector<T>` / `Vector512<T>`,
   `TensorPrimitives`, `ArrayPool<T>` and `MemoryPool<T>`. Hot loops must be allocation-free —
   and "allocation-free" includes the compiler's own: a method that contains a lambda *anywhere*
   allocates its display class on entry, whichever branch runs, so a hot method with a parallel
@@ -1160,7 +1160,7 @@ contiguous reduction vector the tile wants — so nothing is widened or repacked
 quantised once per call (once for q, k and v together), shifted to unsigned for the instruction,
 and the shift is undone with each weight row's sum, computed once per matrix. The scale must be one
 per row: a grouped scale needs a conversion and a multiply-add every 128 weights, about half the
-gain. AMX and AVX-512 VNNI are not exposed by .NET 10 here (`AvxVnni`, the 256-bit form, is), so this
+gain. AMX and AVX-512 VNNI are not exposed by .NET 10 (the version this was measured on; not re-checked on 11) (`AvxVnni`, the 256-bit form, is), so this
 runs at 256 bits; without `AvxVnni` it is weights-only and its output can differ slightly from a
 machine that has it.
 

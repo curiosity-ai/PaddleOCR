@@ -29,7 +29,7 @@ dotnet tool install --global PaddleOCR.Cli
 ```
 
 The assemblies and the namespaces are `PaddleOcrSharp`, which is what the port is called in the
-tree; the packages are the ones above. `net10.0` only — the port leans on
+tree; the packages are the ones above. `net11.0` only — the port leans on
 `System.Numerics.Tensors`, `Vector512<T>` and `TensorPrimitives`.
 
 ## The command-line tool
