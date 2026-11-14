@@ -95,6 +95,13 @@ public static class Gemm
             return;
         }
 
+        // Many rows against weights that opted in go to the integer path.
+        if (GemmInt8.Applies(rows, weight))
+        {
+            GemmInt8.LinearMany(x, rows, inner, [new LinearPart(weight, bias, y)]);
+            return;
+        }
+
         // Many rows go to the outer-product form, which has no final lane reductions and so runs
         // the same arithmetic faster; it is not bit-identical to the dot form below, see GemmOuter.
         if (GemmOuter.Applies(rows))
@@ -192,6 +199,12 @@ public static class Gemm
                 RunPanel(x.Span, rows, inner, part.Weight, part.Bias.Span, part.Output.Span, part.Cols, 0, part.Cols);
             }
 
+            return;
+        }
+
+        if (GemmInt8.AppliesToAll(rows, parts))
+        {
+            GemmInt8.LinearMany(x, rows, inner, parts);
             return;
         }
 

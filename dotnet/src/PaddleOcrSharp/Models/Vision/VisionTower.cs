@@ -69,17 +69,17 @@ public sealed class VisionTower
                 Norm1Bias = weights.Vector(layer + "layer_norm1.bias"),
                 Norm2Weight = weights.Vector(layer + "layer_norm2.weight"),
                 Norm2Bias = weights.Vector(layer + "layer_norm2.bias"),
-                Query = weights.Matrix(layer + "self_attn.q_proj.weight"),
+                Query = weights.Matrix(layer + "self_attn.q_proj.weight", WeightRole.Vision),
                 QueryBias = weights.Vector(layer + "self_attn.q_proj.bias"),
-                Key = weights.Matrix(layer + "self_attn.k_proj.weight"),
+                Key = weights.Matrix(layer + "self_attn.k_proj.weight", WeightRole.Vision),
                 KeyBias = weights.Vector(layer + "self_attn.k_proj.bias"),
-                Value = weights.Matrix(layer + "self_attn.v_proj.weight"),
+                Value = weights.Matrix(layer + "self_attn.v_proj.weight", WeightRole.Vision),
                 ValueBias = weights.Vector(layer + "self_attn.v_proj.bias"),
-                Output = weights.Matrix(layer + "self_attn.out_proj.weight"),
+                Output = weights.Matrix(layer + "self_attn.out_proj.weight", WeightRole.Vision),
                 OutputBias = weights.Vector(layer + "self_attn.out_proj.bias"),
-                Fc1 = weights.Matrix(layer + "mlp.fc1.weight"),
+                Fc1 = weights.Matrix(layer + "mlp.fc1.weight", WeightRole.Vision),
                 Fc1Bias = weights.Vector(layer + "mlp.fc1.bias"),
-                Fc2 = weights.Matrix(layer + "mlp.fc2.weight"),
+                Fc2 = weights.Matrix(layer + "mlp.fc2.weight", WeightRole.Vision),
                 Fc2Bias = weights.Vector(layer + "mlp.fc2.bias"),
             };
         }
@@ -91,9 +91,9 @@ public sealed class VisionTower
         {
             PreNormWeight = weights.Vector("mlp_AR.pre_norm.weight"),
             PreNormBias = weights.Vector("mlp_AR.pre_norm.bias"),
-            Linear1 = weights.Matrix("mlp_AR.linear_1.weight"),
+            Linear1 = weights.Matrix("mlp_AR.linear_1.weight", WeightRole.Vision),
             Linear1Bias = weights.Vector("mlp_AR.linear_1.bias"),
-            Linear2 = weights.Matrix("mlp_AR.linear_2.weight"),
+            Linear2 = weights.Matrix("mlp_AR.linear_2.weight", WeightRole.Vision),
             Linear2Bias = weights.Vector("mlp_AR.linear_2.bias"),
         };
 

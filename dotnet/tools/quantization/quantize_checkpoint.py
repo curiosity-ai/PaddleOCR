@@ -1,6 +1,6 @@
 """Write a PaddleOCR-VL checkpoint whose weights are stored as int8 with group scales.
 
-Usage: quantize_checkpoint.py <out_dir> [--components dec|all] [--source <checkpoint_dir>]
+Usage: quantize_checkpoint.py <out_dir> [--components dec|all] [--group 128|row] [--source <checkpoint_dir>]
 
   dec   the decoder's seven projections per layer and lm_head (the bytes a decode step streams)
   all   those, plus the vision tower's projections and the projector
@@ -11,6 +11,10 @@ consecutive columns, values rounded to nearest even and clamped to [-127, 127]. 
 norms, biases, embeddings, position embeddings — is copied unchanged. This is the same arithmetic as
 the library's on-the-fly path (`--quantization int8`), in float32 throughout, so the two agree
 byte for byte. The config, tokenizer and other small files are copied beside it.
+
+--group row stores one scale per output row instead of one per 128 columns. It is what an
+integer-dot-product kernel wants — one int32 sum per output, scaled once at the end — and costs a
+little weight accuracy against the grouped form.
 
 The result is a plain safetensors file; the library reads an int8 tensor as stored, whatever
 `--quantization` says.
@@ -25,9 +29,12 @@ VIS = re.compile(r"^visual\.vision_model\.encoder\.layers\.\d+\.(self_attn\.(q|k
 def wanted(name, comps):
     return bool(DEC.match(name)) or name == "lm_head.weight" or (comps == "all" and bool(VIS.match(name)))
 
-def quantize(w):
+def group_for(cols, mode):
+    return cols if mode == "row" or cols % GROUP != 0 else GROUP
+
+def quantize(w, mode):
     rows, cols = w.shape
-    group = GROUP if cols % GROUP == 0 else cols
+    group = group_for(cols, mode)
     g = w.reshape(rows, cols // group, group)
     scale = np.abs(g).max(axis=2, keepdims=True) / np.float32(127)
     scale[scale == 0] = np.float32(1)
@@ -38,6 +45,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
     ap.add_argument("--components", choices=("dec", "all"), default="dec")
+    ap.add_argument("--group", choices=("128", "row"), default="128")
     ap.add_argument("--source", default=os.path.expanduser("~/.cache/paddleocr-sharp/PaddleOCR-VL-1.6"))
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
@@ -58,7 +66,7 @@ def main():
     for name, v in items:
         lo, hi = v["data_offsets"]
         if wanted(name, a.components) and v["dtype"] == "BF16" and len(v["shape"]) == 2:
-            rows, cols = v["shape"]; group = GROUP if cols % GROUP == 0 else cols
+            rows, cols = v["shape"]; group = group_for(cols, a.group)
             new_header[name] = {"dtype": "I8", "shape": [rows, cols], "data_offsets": [offset, offset + rows * cols]}
             offset += rows * cols
             sc = rows * (cols // group) * 4
@@ -69,7 +77,7 @@ def main():
             new_header[name] = {"dtype": v["dtype"], "shape": v["shape"], "data_offsets": [offset, offset + hi - lo]}
             offset += hi - lo
             plan.append((name, lo, hi, False))
-    meta = dict(meta); meta["quantization"] = f"int8-g{GROUP}-{a.components}"
+    meta = dict(meta); meta["quantization"] = f"int8-{'row' if a.group == 'row' else 'g' + str(GROUP)}-{a.components}"
     new_header["__metadata__"] = meta
     blob = json.dumps(new_header, separators=(",", ":")).encode()
     blob += b" " * ((-len(blob)) % 8)
@@ -82,7 +90,7 @@ def main():
             if not pick:
                 out.write(raw.tobytes()); continue
             w = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(new_header[name]["shape"])
-            q, s = quantize(w)
+            q, s = quantize(w, a.group)
             out.write(q.tobytes()); out.write(s.tobytes())
     print(f"wrote {out_path}: {os.path.getsize(out_path) / 2**20:.0f} MiB (source {os.path.getsize(path) / 2**20:.0f} MiB), components={a.components}")
 

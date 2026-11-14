@@ -191,12 +191,12 @@ public class Int8WeightTests
         {
             using (WeightStore plain = WeightStore.Open(path))
             {
-                Assert.Equal(DType.BFloat16, plain.Matrix("layer.weight", quantizable: true).Dtype);
+                Assert.Equal(DType.BFloat16, plain.Matrix("layer.weight", WeightRole.Decoder).Dtype);
             }
 
             using (WeightStore asked = WeightStore.Open(path, WeightQuantization.Int8))
             {
-                Assert.Equal(DType.Int8, asked.Matrix("layer.weight", quantizable: true).Dtype);
+                Assert.Equal(DType.Int8, asked.Matrix("layer.weight", WeightRole.Decoder).Dtype);
                 Assert.Equal(DType.BFloat16, asked.Matrix("layer.weight").Dtype);
             }
         }
@@ -251,7 +251,7 @@ public class Int8WeightTests
         try
         {
             using WeightStore store = WeightStore.Open(path, asked);
-            WeightMatrix read = store.Matrix("layer.weight", quantizable: true);
+            WeightMatrix read = store.Matrix("layer.weight", WeightRole.Decoder);
             Assert.Equal(DType.Int8, read.Dtype);
             Assert.Equal(onTheFly.GroupSize, read.GroupSize);
             Assert.Equal(expected.Select(BitConverter.SingleToInt32Bits), Dequantised(read).Select(BitConverter.SingleToInt32Bits));

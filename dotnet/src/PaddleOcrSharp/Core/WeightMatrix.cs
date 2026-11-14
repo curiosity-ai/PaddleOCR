@@ -18,6 +18,13 @@ public readonly struct WeightMatrix
 {
     private readonly ReadOnlyMemory<byte> _bytes;
     private readonly ReadOnlyMemory<float> _scales;
+    private readonly Int8Companion? _companion;
+
+    /// <summary>What an int8 matrix needs besides its values and scales, computed once and shared by copies.</summary>
+    private sealed class Int8Companion
+    {
+        internal volatile int[]? RowSums;
+    }
 
     private WeightMatrix(
         ReadOnlyMemory<byte> bytes,
@@ -26,9 +33,13 @@ public readonly struct WeightMatrix
         int cols,
         bool fromCheckpoint,
         ReadOnlyMemory<float> scales = default,
-        int groupSize = 0)
+        int groupSize = 0,
+        bool computeInt8 = false,
+        Int8Companion? companion = null)
     {
         FromCheckpoint = fromCheckpoint;
+        ComputeInt8 = computeInt8;
+        _companion = companion;
         _scales = scales;
         GroupSize = groupSize;
         _bytes = bytes;
@@ -39,6 +50,39 @@ public readonly struct WeightMatrix
 
     /// <summary>Whether this is a model weight read from a checkpoint, as opposed to scratch posed as one.</summary>
     internal bool FromCheckpoint { get; }
+
+    /// <summary>
+    /// Whether products with many rows may quantise their activations too and run on the integer
+    /// dot-product instruction; see <see cref="GemmInt8"/>. Set by the weight store, never by the file.
+    /// </summary>
+    internal bool ComputeInt8 { get; }
+
+    /// <summary>The int8 values of an <see cref="DType.Int8"/> matrix, row-major.</summary>
+    internal ReadOnlySpan<byte> Int8Values => _bytes.Span;
+
+    /// <summary>The group scales of an <see cref="DType.Int8"/> matrix.</summary>
+    internal ReadOnlySpan<float> Int8Scales => _scales.Span;
+
+    /// <summary>This matrix, marked as free to take the integer-activation path.</summary>
+    internal WeightMatrix WithComputeInt8() =>
+        new(_bytes, Dtype, Rows, Cols, FromCheckpoint, _scales, GroupSize, computeInt8: true, _companion);
+
+    /// <summary>
+    /// The sum of each row's int8 values, computed on first use: the correction that turns an unsigned
+    /// activation dot product back into a signed one.
+    /// </summary>
+    internal ReadOnlySpan<int> GetRowSums()
+    {
+        Int8Companion companion = _companion ?? throw new InvalidOperationException("Not an int8 matrix.");
+        int[]? sums = companion.RowSums;
+        if (sums is null)
+        {
+            sums = Int8Weights.RowSums(_bytes.Span, Rows, Cols);
+            companion.RowSums = sums;
+        }
+
+        return sums;
+    }
 
     /// <summary>Reduction elements per scale for an <see cref="DType.Int8"/> matrix, otherwise 0.</summary>
     public int GroupSize { get; }
@@ -125,7 +169,7 @@ public readonly struct WeightMatrix
             throw new ArgumentException("Too few scales for the matrix.", nameof(scales));
         }
 
-        return new WeightMatrix(values, DType.Int8, rows, cols, fromCheckpoint, scales, groupSize);
+        return new WeightMatrix(values, DType.Int8, rows, cols, fromCheckpoint, scales, groupSize, computeInt8: false, new Int8Companion());
     }
 
     /// <summary>Quantises this bfloat16 or float32 matrix to int8 with one scale per group.</summary>

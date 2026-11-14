@@ -4,6 +4,19 @@ using PaddleOcrSharp.Formats;
 
 namespace PaddleOcrSharp.Models;
 
+/// <summary>What a weight is for, which decides whether it may be quantised on load.</summary>
+public enum WeightRole
+{
+    /// <summary>Never quantised on load: embeddings, the patch embedding, anything small.</summary>
+    Other = 0,
+
+    /// <summary>A decoder projection or the output head.</summary>
+    Decoder = 1,
+
+    /// <summary>A projection in the vision tower or the projector.</summary>
+    Vision = 2,
+}
+
 /// <summary>
 /// Named access to a checkpoint's parameters.
 /// </summary>
@@ -49,10 +62,11 @@ public sealed class WeightStore : IDisposable
     /// store asks for <see cref="WeightQuantization.Int8"/> and the caller says it may be.
     /// </remarks>
     /// <param name="name">The parameter name.</param>
-    /// <param name="quantizable">Whether this weight may be quantised on load.</param>
-    public WeightMatrix Matrix(string name, bool quantizable = false)
+    /// <param name="role">What the weight is for, which decides whether this store may quantise it on load.</param>
+    public WeightMatrix Matrix(string name, WeightRole role = WeightRole.Other)
     {
         WeightTensor tensor = _file[name];
+        bool compute = _quantization == WeightQuantization.Int8Compute;
 
         if (tensor.Dtype == DType.Int8)
         {
@@ -60,12 +74,28 @@ public sealed class WeightStore : IDisposable
             int rows = tensor.Shape[0];
             int cols = tensor.Shape[1];
             int groups = scales.Length / rows;
-            return WeightMatrix.CreateInt8(tensor.Bytes, scales, cols / groups, rows, cols, fromCheckpoint: true);
+            WeightMatrix stored = WeightMatrix.CreateInt8(tensor.Bytes, scales, cols / groups, rows, cols, fromCheckpoint: true);
+            return compute && groups == 1 ? stored.WithComputeInt8() : stored;
         }
 
-        if (quantizable && _quantization == WeightQuantization.Int8 && tensor.Dtype == DType.BFloat16 && tensor.Shape.Length == 2)
+        bool wanted = role switch
         {
-            return _quantized.GetOrAdd(name, static (_, t) => t.AsMatrix().QuantizeInt8(), tensor);
+            WeightRole.Decoder => _quantization != WeightQuantization.None,
+            WeightRole.Vision => compute,
+            _ => false,
+        };
+
+        if (wanted && tensor.Dtype == DType.BFloat16 && tensor.Shape.Length == 2)
+        {
+            return _quantized.GetOrAdd(
+                name,
+                static (_, state) =>
+                {
+                    // Integer arithmetic wants one scale per row; weight-only int8 keeps groups of 128.
+                    WeightMatrix q = state.Tensor.AsMatrix().QuantizeInt8(state.Compute ? state.Tensor.Shape[1] : 0);
+                    return state.Compute ? q.WithComputeInt8() : q;
+                },
+                (Tensor: tensor, Compute: compute));
         }
 
         return tensor.AsMatrix();

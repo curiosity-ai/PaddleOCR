@@ -25,4 +25,15 @@ public enum WeightQuantization
     /// the checkpoint already holds them quantised.
     /// </summary>
     Int8 = 1,
+
+    /// <summary>
+    /// <see cref="Int8"/>, and also the vision tower, the projector and the decoder's prefill run in
+    /// integer arithmetic: weights have one scale per row, the activations of any product with at
+    /// least 32 rows are quantised per row as well, and the multiply-adds use the AVX-VNNI
+    /// dot-product instruction, which is about three times the float32 tile's rate. Quantising the
+    /// activations costs more accuracy than quantising the weights; see <c>CLAUDE.md</c>. On a
+    /// machine without AVX-VNNI this is weights-only, and its output can differ slightly from a
+    /// machine that has it.
+    /// </summary>
+    Int8Compute = 2,
 }

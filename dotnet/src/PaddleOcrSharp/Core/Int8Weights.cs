@@ -78,6 +78,45 @@ internal static unsafe class Int8Weights
         return (values, scales);
     }
 
+    /// <summary>The sum of each row's int8 values, one int per row.</summary>
+    internal static int[] RowSums(ReadOnlySpan<byte> values, int rows, int cols)
+    {
+        int[] sums = new int[rows];
+        fixed (byte* pv = values)
+        {
+            byte* origin = pv;
+            Parallelism.For((rows + 63) / 64, block =>
+            {
+                for (int r = block * 64; r < Math.Min(rows, (block + 1) * 64); r++)
+                {
+                    sbyte* row = (sbyte*)origin + ((long)r * cols);
+                    long total = 0;
+                    int i = 0;
+                    if (AvxVnni.IsSupported)
+                    {
+                        Vector256<int> acc = default;
+                        Vector256<byte> ones = Vector256.Create((byte)1);
+                        for (; i + 32 <= cols; i += 32)
+                        {
+                            acc = AvxVnni.MultiplyWideningAndAdd(acc, ones, Vector256.Load(row + i));
+                        }
+
+                        total = Vector256.Sum(acc);
+                    }
+
+                    for (; i < cols; i++)
+                    {
+                        total += row[i];
+                    }
+
+                    sums[r] = (int)total;
+                }
+            });
+        }
+
+        return sums;
+    }
+
     /// <summary>Dequantises one row: <c>destination[i] = q[i] · scale[i / group]</c>.</summary>
     internal static void DequantizeRow(ReadOnlySpan<byte> values, ReadOnlySpan<float> scales, int group, Span<float> destination)
     {
