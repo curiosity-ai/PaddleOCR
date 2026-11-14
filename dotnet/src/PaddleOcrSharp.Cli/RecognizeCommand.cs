@@ -65,7 +65,7 @@ public static class RecognizeCommand
             .ConfigureAwait(false);
 
         var clock = Stopwatch.StartNew();
-        using PaddleOcrVLModel model = PaddleOcrVLModel.Load(directory);
+        using PaddleOcrVLModel model = PaddleOcrVLModel.Load(directory, ModelLocator.QuantizationFrom(command));
         TimeSpan loaded = clock.Elapsed;
 
         using RgbImage image = ImageIO.Load(imagePath);

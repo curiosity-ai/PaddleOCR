@@ -339,7 +339,11 @@ public static class Gemm
     {
         const int TargetPanelBytes = 256 * 1024;
 
-        int rowBytes = Math.Max(1, inner * dtype.ByteSize());
+        // A narrow dtype is widened to float32 before use, so what has to fit in L2 is four bytes an
+        // element whatever the storage: size the panel as if two bytes were stored, which is what
+        // it was sized by for bfloat16 and leaves that case unchanged. Int8 would otherwise get a
+        // panel twice as wide as L2 holds.
+        int rowBytes = Math.Max(1, inner * Math.Max(2, dtype.ByteSize()));
         int panel = Math.Max(ColBlock, TargetPanelBytes / rowBytes);
         panel = (panel + ColBlock - 1) / ColBlock * ColBlock;
 

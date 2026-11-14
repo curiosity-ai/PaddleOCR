@@ -34,7 +34,7 @@ public sealed class ErnieDecoder
         _config = config;
         _rope = new MRotaryEmbedding(config);
         _embeddings = weights.Matrix(prefix + "embed_tokens.weight");
-        _lmHead = weights.Matrix(lmHeadName);
+        _lmHead = weights.Matrix(lmHeadName, quantizable: true);
         _finalNorm = weights.Vector(prefix + "norm.weight");
 
         _layers = new LayerWeights[config.NumHiddenLayers];
@@ -45,13 +45,13 @@ public sealed class ErnieDecoder
             {
                 InputNorm = weights.Vector(layer + "input_layernorm.weight"),
                 PostAttentionNorm = weights.Vector(layer + "post_attention_layernorm.weight"),
-                Query = weights.Matrix(layer + "self_attn.q_proj.weight"),
-                Key = weights.Matrix(layer + "self_attn.k_proj.weight"),
-                Value = weights.Matrix(layer + "self_attn.v_proj.weight"),
-                Output = weights.Matrix(layer + "self_attn.o_proj.weight"),
-                Gate = weights.Matrix(layer + "mlp.gate_proj.weight"),
-                Up = weights.Matrix(layer + "mlp.up_proj.weight"),
-                Down = weights.Matrix(layer + "mlp.down_proj.weight"),
+                Query = weights.Matrix(layer + "self_attn.q_proj.weight", quantizable: true),
+                Key = weights.Matrix(layer + "self_attn.k_proj.weight", quantizable: true),
+                Value = weights.Matrix(layer + "self_attn.v_proj.weight", quantizable: true),
+                Output = weights.Matrix(layer + "self_attn.o_proj.weight", quantizable: true),
+                Gate = weights.Matrix(layer + "mlp.gate_proj.weight", quantizable: true),
+                Up = weights.Matrix(layer + "mlp.up_proj.weight", quantizable: true),
+                Down = weights.Matrix(layer + "mlp.down_proj.weight", quantizable: true),
             };
         }
     }

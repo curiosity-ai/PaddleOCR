@@ -47,11 +47,13 @@ public sealed class PaddleOcrVLModel : IDisposable
     /// Loads a model from a directory holding <c>model.safetensors</c>, <c>config.json</c> and
     /// <c>tokenizer.json</c>.
     /// </summary>
-    public static PaddleOcrVLModel Load(string directory)
+    /// <param name="directory">The checkpoint directory.</param>
+    /// <param name="quantization">How to hold the language model's weights; see <see cref="WeightQuantization"/>.</param>
+    public static PaddleOcrVLModel Load(string directory, WeightQuantization quantization = WeightQuantization.None)
     {
         ModelConfiguration configuration = ModelConfiguration.Load(directory);
         var tokenizer = BpeTokenizer.FromFile(Path.Combine(directory, "tokenizer.json"));
-        WeightStore weights = WeightStore.Open(Path.Combine(directory, "model.safetensors"));
+        WeightStore weights = WeightStore.Open(Path.Combine(directory, "model.safetensors"), quantization);
         return new PaddleOcrVLModel(weights, ownsWeights: true, configuration, tokenizer);
     }
 

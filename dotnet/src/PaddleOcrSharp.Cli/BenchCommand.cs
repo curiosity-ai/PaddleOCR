@@ -67,7 +67,7 @@ public static class BenchCommand
             .ConfigureAwait(false);
 
         var clock = Stopwatch.StartNew();
-        using PaddleOcrVLModel model = PaddleOcrVLModel.Load(directory);
+        using PaddleOcrVLModel model = PaddleOcrVLModel.Load(directory, ModelLocator.QuantizationFrom(command));
         Console.WriteLine($"Load: {clock.Elapsed.TotalSeconds:F2}s");
 
         clock.Restart();

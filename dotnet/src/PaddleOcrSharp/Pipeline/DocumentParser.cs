@@ -51,13 +51,15 @@ public sealed class DocumentParser : IDisposable
     /// <param name="layoutDirectory">Directory holding PP-DocLayoutV3, or <see langword="null"/>.</param>
     /// <param name="orientationDirectory">Directory holding PP-LCNet_x1_0_doc_ori, or <see langword="null"/>.</param>
     /// <param name="unwarpingDirectory">Directory holding UVDoc, or <see langword="null"/>.</param>
+    /// <param name="quantization">How to hold the language model's weights; see <see cref="WeightQuantization"/>.</param>
     public static DocumentParser Load(
         string visionLanguageDirectory,
         string? layoutDirectory,
         string? orientationDirectory = null,
-        string? unwarpingDirectory = null)
+        string? unwarpingDirectory = null,
+        WeightQuantization quantization = WeightQuantization.None)
     {
-        PaddleOcrVLModel model = PaddleOcrVLModel.Load(visionLanguageDirectory);
+        PaddleOcrVLModel model = PaddleOcrVLModel.Load(visionLanguageDirectory, quantization);
         LayoutDetector? layout = layoutDirectory is null ? null : LayoutDetector.Load(layoutDirectory);
         DocOrientationClassifier? orientation = orientationDirectory is null
             ? null

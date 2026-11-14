@@ -1,4 +1,5 @@
 using PaddleOcrSharp.Download;
+using PaddleOcrSharp.Models;
 
 namespace PaddleOcrSharp.Cli;
 
@@ -38,6 +39,26 @@ public static class ModelLocator
 
         Console.Error.WriteLine($"Fetching {model.Name} into {downloader.CacheRoot} …");
         return await downloader.EnsureAsync(model, progress: null, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads how the language model's weights should be held: <c>--quantization none|int8</c>, or the
+    /// <c>PADDLEOCR_SHARP_QUANTIZATION</c> environment variable, or none.
+    /// </summary>
+    public static WeightQuantization QuantizationFrom(CommandLine command)
+    {
+        string? text = command.Get("quantization") ?? Environment.GetEnvironmentVariable("PADDLEOCR_SHARP_QUANTIZATION");
+        if (string.IsNullOrWhiteSpace(text) || text.Equals("none", StringComparison.OrdinalIgnoreCase))
+        {
+            return WeightQuantization.None;
+        }
+
+        if (text.Equals("int8", StringComparison.OrdinalIgnoreCase))
+        {
+            return WeightQuantization.Int8;
+        }
+
+        throw new ArgumentException($"Unknown quantization '{text}'. Use none or int8.");
     }
 
     /// <summary>

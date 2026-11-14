@@ -16,19 +16,25 @@ public sealed class WeightStore : IDisposable
 {
     private readonly SafetensorsFile _file;
     private readonly ConcurrentDictionary<string, float[]> _vectorCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, WeightMatrix> _quantized = new(StringComparer.Ordinal);
     private readonly bool _ownsFile;
+    private readonly WeightQuantization _quantization;
 
-    private WeightStore(SafetensorsFile file, bool ownsFile)
+    private WeightStore(SafetensorsFile file, bool ownsFile, WeightQuantization quantization)
     {
         _file = file;
         _ownsFile = ownsFile;
+        _quantization = quantization;
     }
 
     /// <summary>Opens the safetensors file at <paramref name="path"/>.</summary>
-    public static WeightStore Open(string path) => new(SafetensorsFile.Open(path), ownsFile: true);
+    /// <param name="path">The checkpoint.</param>
+    /// <param name="quantization">How to hold the weights that <see cref="Matrix"/> is told may be quantised.</param>
+    public static WeightStore Open(string path, WeightQuantization quantization = WeightQuantization.None) =>
+        new(SafetensorsFile.Open(path), ownsFile: true, quantization);
 
     /// <summary>Wraps an already-open file without taking ownership of it.</summary>
-    public static WeightStore Wrap(SafetensorsFile file) => new(file, ownsFile: false);
+    public static WeightStore Wrap(SafetensorsFile file) => new(file, ownsFile: false, WeightQuantization.None);
 
     /// <summary>Every parameter name in the checkpoint.</summary>
     public IReadOnlyCollection<string> Names => _file.Names;
@@ -37,7 +43,33 @@ public sealed class WeightStore : IDisposable
     public bool Contains(string name) => _file.Contains(name);
 
     /// <summary>Gets a 2-D parameter as a weight matrix in <c>nn.Linear</c> layout.</summary>
-    public WeightMatrix Matrix(string name) => _file[name].AsMatrix();
+    /// <remarks>
+    /// A tensor stored as int8 is read with its scales, which sit beside it as <c>name.scale</c>,
+    /// whatever the store was opened with. A bfloat16 one is quantised as it is read when the
+    /// store asks for <see cref="WeightQuantization.Int8"/> and the caller says it may be.
+    /// </remarks>
+    /// <param name="name">The parameter name.</param>
+    /// <param name="quantizable">Whether this weight may be quantised on load.</param>
+    public WeightMatrix Matrix(string name, bool quantizable = false)
+    {
+        WeightTensor tensor = _file[name];
+
+        if (tensor.Dtype == DType.Int8)
+        {
+            float[] scales = Vector(name + ".scale");
+            int rows = tensor.Shape[0];
+            int cols = tensor.Shape[1];
+            int groups = scales.Length / rows;
+            return WeightMatrix.CreateInt8(tensor.Bytes, scales, cols / groups, rows, cols, fromCheckpoint: true);
+        }
+
+        if (quantizable && _quantization == WeightQuantization.Int8 && tensor.Dtype == DType.BFloat16 && tensor.Shape.Length == 2)
+        {
+            return _quantized.GetOrAdd(name, static (_, t) => t.AsMatrix().QuantizeInt8(), tensor);
+        }
+
+        return tensor.AsMatrix();
+    }
 
     /// <summary>
     /// Gets a parameter of any rank as a <c>[rows, cols]</c> matrix, folding trailing dimensions
@@ -68,6 +100,7 @@ public sealed class WeightStore : IDisposable
     public void Dispose()
     {
         _vectorCache.Clear();
+        _quantized.Clear();
         if (_ownsFile)
         {
             _file.Dispose();

@@ -57,6 +57,13 @@ public static class Help
                                       core). Independent of --block-concurrency, which decides how
                                       many blocks run at once; the two multiply. -1 removes the cap,
                                       which is slower here — see CLAUDE.md.
+              --quantization none|int8
+                          How the language model's weights are held (default: none).
+                          int8 keeps the decoder's projections and output head as bytes
+                          with a scale per 128 weights, which halves what a decode step
+                          streams. Nothing is calibrated; formulas can change in small
+                          ways. A checkpoint already quantised on disk is read as it is
+                          stored. PADDLEOCR_SHARP_QUANTIZATION sets the default.
               --max-new-tokens <n>    Token budget per block (default: 8192)
               --stop-on-repetition <bool>
                                       Stop a block once its output has fallen into a verbatim
