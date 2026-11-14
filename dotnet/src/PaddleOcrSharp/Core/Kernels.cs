@@ -308,14 +308,21 @@ public static class Kernels
     /// 27-layer tower over a 5000-patch block writes and re-reads eleven billion floats for it.
     /// </para>
     /// </remarks>
-    public static void ScaledSoftmax(Span<float> values, float scale)
+    public static void ScaledSoftmax(Span<float> values, float scale) =>
+        ScaledSoftmax(values, scale, float.NaN);
+
+    /// <summary>
+    /// As <see cref="ScaledSoftmax(Span{float}, float)"/>, given the row's unscaled maximum when
+    /// the caller already has it; NaN means to find it here.
+    /// </summary>
+    internal static void ScaledSoftmax(Span<float> values, float scale, float rawMax)
     {
         if (values.IsEmpty)
         {
             return;
         }
 
-        float max = TensorPrimitives.Max(values) * scale;
+        float max = (float.IsNaN(rawMax) ? TensorPrimitives.Max(values) : rawMax) * scale;
         if (float.IsNegativeInfinity(max))
         {
             values.Fill(0f);

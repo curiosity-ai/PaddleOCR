@@ -47,7 +47,7 @@ public static class Attention
     {
         // Wide enough that a block amortises the key and value traffic, narrow enough that the
         // scores stay well inside L2 (16 x 5120 floats is 320 KB at the largest page we accept).
-        const int Block = 16;
+        int Block = AttentionTuning.Block;
 
         long transposeTicks = 0, scoreTicks = 0, softmaxTicks = 0, valueTicks = 0;
 
@@ -72,7 +72,7 @@ public static class Attention
             // One transpose of this head's keys serves every row-block below, of which there are
             // `tokens / Block`. See AttentionKernels for why the score product wants them this
             // way round.
-            using PooledBuffer keysT = TensorPool.Rent(headDim * keyStride);
+            using PooledBuffer keysT = TensorPool.Rent(AttentionKernels.KeyBufferLength(tokens, headDim, keyStride));
             long mark = Stopwatch.GetTimestamp();
             AttentionKernels.TransposeHead(k.Span, tokens, headDim, keysT.Span, keyStride);
             long transpose = Stopwatch.GetTimestamp() - mark;
@@ -83,6 +83,8 @@ public static class Attention
                 int rows = Math.Min(Block, tokens - start);
                 Memory<float> block = scores[..(rows * keyStride)];
 
+                Span<float> rowMax = stackalloc float[rows];
+                rowMax.Fill(float.NegativeInfinity);
                 mark = Stopwatch.GetTimestamp();
                 AttentionKernels.Scores(
                     queries.Span.Slice(headOffset + (start * headDim), rows * headDim),
@@ -92,14 +94,18 @@ public static class Attention
                     tokens,
                     keyStride,
                     block.Span,
-                    keyStride);
+                    keyStride,
+                    rowMax);
                 score += Stopwatch.GetTimestamp() - mark;
 
                 mark = Stopwatch.GetTimestamp();
                 Span<float> rowsSpan = block.Span;
                 for (int row = 0; row < rows; row++)
                 {
-                    Kernels.ScaledSoftmax(rowsSpan.Slice(row * keyStride, tokens), scale);
+                    Kernels.ScaledSoftmax(
+                        rowsSpan.Slice(row * keyStride, tokens),
+                        scale,
+                        AttentionTuning.TileMax ? rowMax[row] : float.NaN);
                 }
 
                 soft += Stopwatch.GetTimestamp() - mark;

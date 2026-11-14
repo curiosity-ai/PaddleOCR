@@ -39,7 +39,7 @@ internal static class AttentionKernels
     /// Keys one pass of the score kernel covers, so its slice of the transposed keys stays in L1
     /// while the block's row groups sweep it.
     /// </summary>
-    private const int ScoreColumns = 128;
+    private static readonly int ScoreColumns = AttentionTuning.ScoreColumns;
 
     /// <summary>
     /// Computes <c>scores[r, t] = Σ_d queries[r, d] · keysT[d, t]</c>.
@@ -60,42 +60,312 @@ internal static class AttentionKernels
         int tokens,
         int keyStride,
         Span<float> scores,
-        int scoreStride)
+        int scoreStride,
+        Span<float> rowMax = default)
     {
         // Token block outermost, row group innermost. A tile of the transposed keys is
-        // `headDim` lines of `ScoreColumns` floats — 4.6 KB at a head width of 72 — and the row
-        // groups inside it each sweep that tile once, from L1. Row group outermost instead reads
-        // the head's whole key matrix once per group, which at 1.4 MB is four passes through L2
-        // per block for the same arithmetic.
-        int token = 0;
-        for (; token <= tokens - ScoreColumns; token += ScoreColumns)
+        // `headDim` lines of `ScoreColumns` floats, and the row groups inside it each sweep that
+        // tile once, from L1. Row group outermost instead reads the head's whole key matrix once
+        // per group.
+        int tile = ScoreColumns;
+        for (int token = 0; token < tokens; token += tile)
         {
-            int row = 0;
-            for (; row <= rows - ScoreRows; row += ScoreRows)
+            int count = Math.Min(tile, tokens - token);
+            int kBase = AttentionTuning.TileMajor ? ((token / tile) * headDim * tile) - token : 0;
+            int kD = AttentionTuning.TileMajor ? tile : keyStride;
+            ScoreTile(queries, rows, headDim, keysT, tokens, kBase, kD, scores, scoreStride, token, count);
+            if (AttentionTuning.TileMax)
             {
-                ScoreQuad(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, ScoreColumns);
+                TileMax(scores, scoreStride, rows, token, count, rowMax);
             }
+        }
+    }
 
-            for (; row < rows; row++)
+    /// <summary>Every query row of the block against one tile of keys.</summary>
+    private static void ScoreTile(
+        ReadOnlySpan<float> queries,
+        int rows,
+        int headDim,
+        ReadOnlySpan<float> keysT,
+        int tokens,
+        int kBase,
+        int kD,
+        Span<float> scores,
+        int scoreStride,
+        int first,
+        int count)
+    {
+        int row = 0;
+        int end = first + count;
+        if (Simd.Use512)
+        {
+            switch (AttentionTuning.Tile)
             {
-                ScoreSingle(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, ScoreColumns);
+                case 1:
+                    for (; row <= rows - 8; row += 8)
+                    {
+                        int next = ScoreOct(queries, row, headDim, keysT, kBase, kD, scores, scoreStride, first, count);
+                        if (next < end)
+                        {
+                            ScoreQuad(queries, row, headDim, keysT, tokens, kBase, kD, scores, scoreStride, next, end - next);
+                            ScoreQuad(queries, row + 4, headDim, keysT, tokens, kBase, kD, scores, scoreStride, next, end - next);
+                        }
+                    }
+
+                    break;
+                case 3:
+                    for (; row <= rows - 6; row += 6)
+                    {
+                        int next = ScoreSext(queries, row, headDim, keysT, kBase, kD, scores, scoreStride, first, count);
+                        if (next < end)
+                        {
+                            ScoreQuad(queries, row, headDim, keysT, tokens, kBase, kD, scores, scoreStride, next, end - next);
+                            ScoreSingle(queries, row + 4, headDim, keysT, tokens, kBase, kD, scores, scoreStride, next, end - next);
+                            ScoreSingle(queries, row + 5, headDim, keysT, tokens, kBase, kD, scores, scoreStride, next, end - next);
+                        }
+                    }
+
+                    break;
             }
         }
 
-        if (token < tokens)
+        for (; row <= rows - ScoreRows; row += ScoreRows)
         {
-            int remaining = tokens - token;
-            int row = 0;
-            for (; row <= rows - ScoreRows; row += ScoreRows)
+            if (AttentionTuning.Tile == 2 && Simd.Use512)
             {
-                ScoreQuad(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, remaining);
+                int next = ScoreQuad3(queries, row, headDim, keysT, kBase, kD, scores, scoreStride, first, count);
+                if (next < end)
+                {
+                    ScoreQuad(queries, row, headDim, keysT, tokens, kBase, kD, scores, scoreStride, next, end - next);
+                }
             }
-
-            for (; row < rows; row++)
+            else
             {
-                ScoreSingle(queries, row, headDim, keysT, tokens, keyStride, scores, scoreStride, token, remaining);
+                ScoreQuad(queries, row, headDim, keysT, tokens, kBase, kD, scores, scoreStride, first, count);
             }
         }
+
+        for (; row < rows; row++)
+        {
+            ScoreSingle(queries, row, headDim, keysT, tokens, kBase, kD, scores, scoreStride, first, count);
+        }
+    }
+
+    /// <summary>Takes each row's maximum over the columns just written, while they are in L1.</summary>
+    private static void TileMax(Span<float> scores, int scoreStride, int rows, int first, int count, Span<float> rowMax)
+    {
+        for (int r = 0; r < rows; r++)
+        {
+            float m = System.Numerics.Tensors.TensorPrimitives.Max(scores.Slice((r * scoreStride) + first, count));
+            if (m > rowMax[r])
+            {
+                rowMax[r] = m;
+            }
+        }
+    }
+
+    /// <summary>Eight query rows by two column vectors, sixteen accumulators. Returns the first column not done.</summary>
+    private static int ScoreOct(
+        ReadOnlySpan<float> queries, int row, int headDim, ReadOnlySpan<float> keysT, int kBase, int keyStride,
+        Span<float> scores, int scoreStride, int first, int count)
+    {
+        ref float q = ref MemoryMarshal.GetReference(queries);
+        ref float k = ref MemoryMarshal.GetReference(keysT);
+        ref float s = ref MemoryMarshal.GetReference(scores);
+        int q0 = row * headDim;
+        int s0 = row * scoreStride;
+        int wide = Vector512<float>.Count;
+        int token = first;
+        int end = first + count;
+        for (; token <= end - (2 * wide); token += 2 * wide)
+        {
+            Vector512<float> z0 = Vector512<float>.Zero, y0 = Vector512<float>.Zero;
+            Vector512<float> z1 = Vector512<float>.Zero, y1 = Vector512<float>.Zero;
+            Vector512<float> z2 = Vector512<float>.Zero, y2 = Vector512<float>.Zero;
+            Vector512<float> z3 = Vector512<float>.Zero, y3 = Vector512<float>.Zero;
+            Vector512<float> z4 = Vector512<float>.Zero, y4 = Vector512<float>.Zero;
+            Vector512<float> z5 = Vector512<float>.Zero, y5 = Vector512<float>.Zero;
+            Vector512<float> z6 = Vector512<float>.Zero, y6 = Vector512<float>.Zero;
+            Vector512<float> z7 = Vector512<float>.Zero, y7 = Vector512<float>.Zero;
+
+            for (int d = 0; d < headDim; d++)
+            {
+                int column = kBase + (d * keyStride) + token;
+                Vector512<float> k0 = Vector512.LoadUnsafe(ref k, (nuint)(column));
+                Vector512<float> k1 = Vector512.LoadUnsafe(ref k, (nuint)(column + wide));
+
+                Vector512<float> v = Vector512.Create(Unsafe.Add(ref q, q0 + d));
+                z0 = Vector512.FusedMultiplyAdd(v, k0, z0);
+                y0 = Vector512.FusedMultiplyAdd(v, k1, y0);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 1 * headDim + d));
+                z1 = Vector512.FusedMultiplyAdd(v, k0, z1);
+                y1 = Vector512.FusedMultiplyAdd(v, k1, y1);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 2 * headDim + d));
+                z2 = Vector512.FusedMultiplyAdd(v, k0, z2);
+                y2 = Vector512.FusedMultiplyAdd(v, k1, y2);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 3 * headDim + d));
+                z3 = Vector512.FusedMultiplyAdd(v, k0, z3);
+                y3 = Vector512.FusedMultiplyAdd(v, k1, y3);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 4 * headDim + d));
+                z4 = Vector512.FusedMultiplyAdd(v, k0, z4);
+                y4 = Vector512.FusedMultiplyAdd(v, k1, y4);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 5 * headDim + d));
+                z5 = Vector512.FusedMultiplyAdd(v, k0, z5);
+                y5 = Vector512.FusedMultiplyAdd(v, k1, y5);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 6 * headDim + d));
+                z6 = Vector512.FusedMultiplyAdd(v, k0, z6);
+                y6 = Vector512.FusedMultiplyAdd(v, k1, y6);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 7 * headDim + d));
+                z7 = Vector512.FusedMultiplyAdd(v, k0, z7);
+                y7 = Vector512.FusedMultiplyAdd(v, k1, y7);
+            }
+
+            z0.StoreUnsafe(ref s, (nuint)(s0 + token));
+            y0.StoreUnsafe(ref s, (nuint)(s0 + token + 1 * wide));
+            z1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token));
+            y1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token + 1 * wide));
+            z2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token));
+            y2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token + 1 * wide));
+            z3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token));
+            y3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token + 1 * wide));
+            z4.StoreUnsafe(ref s, (nuint)(s0 + 4 * scoreStride + token));
+            y4.StoreUnsafe(ref s, (nuint)(s0 + 4 * scoreStride + token + 1 * wide));
+            z5.StoreUnsafe(ref s, (nuint)(s0 + 5 * scoreStride + token));
+            y5.StoreUnsafe(ref s, (nuint)(s0 + 5 * scoreStride + token + 1 * wide));
+            z6.StoreUnsafe(ref s, (nuint)(s0 + 6 * scoreStride + token));
+            y6.StoreUnsafe(ref s, (nuint)(s0 + 6 * scoreStride + token + 1 * wide));
+            z7.StoreUnsafe(ref s, (nuint)(s0 + 7 * scoreStride + token));
+            y7.StoreUnsafe(ref s, (nuint)(s0 + 7 * scoreStride + token + 1 * wide));
+        }
+
+        return token;
+    }
+
+    /// <summary>Six query rows by two column vectors, twelve accumulators. Returns the first column not done.</summary>
+    private static int ScoreSext(
+        ReadOnlySpan<float> queries, int row, int headDim, ReadOnlySpan<float> keysT, int kBase, int keyStride,
+        Span<float> scores, int scoreStride, int first, int count)
+    {
+        ref float q = ref MemoryMarshal.GetReference(queries);
+        ref float k = ref MemoryMarshal.GetReference(keysT);
+        ref float s = ref MemoryMarshal.GetReference(scores);
+        int q0 = row * headDim;
+        int s0 = row * scoreStride;
+        int wide = Vector512<float>.Count;
+        int token = first;
+        int end = first + count;
+        for (; token <= end - (2 * wide); token += 2 * wide)
+        {
+            Vector512<float> z0 = Vector512<float>.Zero, y0 = Vector512<float>.Zero;
+            Vector512<float> z1 = Vector512<float>.Zero, y1 = Vector512<float>.Zero;
+            Vector512<float> z2 = Vector512<float>.Zero, y2 = Vector512<float>.Zero;
+            Vector512<float> z3 = Vector512<float>.Zero, y3 = Vector512<float>.Zero;
+            Vector512<float> z4 = Vector512<float>.Zero, y4 = Vector512<float>.Zero;
+            Vector512<float> z5 = Vector512<float>.Zero, y5 = Vector512<float>.Zero;
+
+            for (int d = 0; d < headDim; d++)
+            {
+                int column = kBase + (d * keyStride) + token;
+                Vector512<float> k0 = Vector512.LoadUnsafe(ref k, (nuint)(column));
+                Vector512<float> k1 = Vector512.LoadUnsafe(ref k, (nuint)(column + wide));
+
+                Vector512<float> v = Vector512.Create(Unsafe.Add(ref q, q0 + d));
+                z0 = Vector512.FusedMultiplyAdd(v, k0, z0);
+                y0 = Vector512.FusedMultiplyAdd(v, k1, y0);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 1 * headDim + d));
+                z1 = Vector512.FusedMultiplyAdd(v, k0, z1);
+                y1 = Vector512.FusedMultiplyAdd(v, k1, y1);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 2 * headDim + d));
+                z2 = Vector512.FusedMultiplyAdd(v, k0, z2);
+                y2 = Vector512.FusedMultiplyAdd(v, k1, y2);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 3 * headDim + d));
+                z3 = Vector512.FusedMultiplyAdd(v, k0, z3);
+                y3 = Vector512.FusedMultiplyAdd(v, k1, y3);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 4 * headDim + d));
+                z4 = Vector512.FusedMultiplyAdd(v, k0, z4);
+                y4 = Vector512.FusedMultiplyAdd(v, k1, y4);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 5 * headDim + d));
+                z5 = Vector512.FusedMultiplyAdd(v, k0, z5);
+                y5 = Vector512.FusedMultiplyAdd(v, k1, y5);
+            }
+
+            z0.StoreUnsafe(ref s, (nuint)(s0 + token));
+            y0.StoreUnsafe(ref s, (nuint)(s0 + token + 1 * wide));
+            z1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token));
+            y1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token + 1 * wide));
+            z2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token));
+            y2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token + 1 * wide));
+            z3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token));
+            y3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token + 1 * wide));
+            z4.StoreUnsafe(ref s, (nuint)(s0 + 4 * scoreStride + token));
+            y4.StoreUnsafe(ref s, (nuint)(s0 + 4 * scoreStride + token + 1 * wide));
+            z5.StoreUnsafe(ref s, (nuint)(s0 + 5 * scoreStride + token));
+            y5.StoreUnsafe(ref s, (nuint)(s0 + 5 * scoreStride + token + 1 * wide));
+        }
+
+        return token;
+    }
+
+    /// <summary>Four query rows by three column vectors, twelve accumulators. Returns the first column not done.</summary>
+    private static int ScoreQuad3(
+        ReadOnlySpan<float> queries, int row, int headDim, ReadOnlySpan<float> keysT, int kBase, int keyStride,
+        Span<float> scores, int scoreStride, int first, int count)
+    {
+        ref float q = ref MemoryMarshal.GetReference(queries);
+        ref float k = ref MemoryMarshal.GetReference(keysT);
+        ref float s = ref MemoryMarshal.GetReference(scores);
+        int q0 = row * headDim;
+        int s0 = row * scoreStride;
+        int wide = Vector512<float>.Count;
+        int token = first;
+        int end = first + count;
+        for (; token <= end - (3 * wide); token += 3 * wide)
+        {
+            Vector512<float> z0 = Vector512<float>.Zero, y0 = Vector512<float>.Zero, x0 = Vector512<float>.Zero;
+            Vector512<float> z1 = Vector512<float>.Zero, y1 = Vector512<float>.Zero, x1 = Vector512<float>.Zero;
+            Vector512<float> z2 = Vector512<float>.Zero, y2 = Vector512<float>.Zero, x2 = Vector512<float>.Zero;
+            Vector512<float> z3 = Vector512<float>.Zero, y3 = Vector512<float>.Zero, x3 = Vector512<float>.Zero;
+
+            for (int d = 0; d < headDim; d++)
+            {
+                int column = kBase + (d * keyStride) + token;
+                Vector512<float> k0 = Vector512.LoadUnsafe(ref k, (nuint)(column));
+                Vector512<float> k1 = Vector512.LoadUnsafe(ref k, (nuint)(column + wide));
+                Vector512<float> k2 = Vector512.LoadUnsafe(ref k, (nuint)(column + 2 * wide));
+
+                Vector512<float> v = Vector512.Create(Unsafe.Add(ref q, q0 + d));
+                z0 = Vector512.FusedMultiplyAdd(v, k0, z0);
+                y0 = Vector512.FusedMultiplyAdd(v, k1, y0);
+                x0 = Vector512.FusedMultiplyAdd(v, k2, x0);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 1 * headDim + d));
+                z1 = Vector512.FusedMultiplyAdd(v, k0, z1);
+                y1 = Vector512.FusedMultiplyAdd(v, k1, y1);
+                x1 = Vector512.FusedMultiplyAdd(v, k2, x1);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 2 * headDim + d));
+                z2 = Vector512.FusedMultiplyAdd(v, k0, z2);
+                y2 = Vector512.FusedMultiplyAdd(v, k1, y2);
+                x2 = Vector512.FusedMultiplyAdd(v, k2, x2);
+                v = Vector512.Create(Unsafe.Add(ref q, q0 + 3 * headDim + d));
+                z3 = Vector512.FusedMultiplyAdd(v, k0, z3);
+                y3 = Vector512.FusedMultiplyAdd(v, k1, y3);
+                x3 = Vector512.FusedMultiplyAdd(v, k2, x3);
+            }
+
+            z0.StoreUnsafe(ref s, (nuint)(s0 + token));
+            y0.StoreUnsafe(ref s, (nuint)(s0 + token + 1 * wide));
+            x0.StoreUnsafe(ref s, (nuint)(s0 + token + 2 * wide));
+            z1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token));
+            y1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token + 1 * wide));
+            x1.StoreUnsafe(ref s, (nuint)(s0 + 1 * scoreStride + token + 2 * wide));
+            z2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token));
+            y2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token + 1 * wide));
+            x2.StoreUnsafe(ref s, (nuint)(s0 + 2 * scoreStride + token + 2 * wide));
+            z3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token));
+            y3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token + 1 * wide));
+            x3.StoreUnsafe(ref s, (nuint)(s0 + 3 * scoreStride + token + 2 * wide));
+        }
+
+        return token;
     }
 
     /// <summary>Four query rows against every key, two column vectors at a time.</summary>
@@ -105,6 +375,7 @@ internal static class AttentionKernels
         int headDim,
         ReadOnlySpan<float> keysT,
         int tokens,
+        int kBase,
         int keyStride,
         Span<float> scores,
         int scoreStride,
@@ -133,7 +404,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * keyStride) + token;
+                    int column = kBase + (d * keyStride) + token;
                     Vector512<float> kLo = Vector512.LoadUnsafe(ref k, (nuint)column);
                     Vector512<float> kHi = Vector512.LoadUnsafe(ref k, (nuint)(column + wide));
 
@@ -176,7 +447,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * keyStride) + token;
+                    int column = kBase + (d * keyStride) + token;
                     Vector256<float> kLo = Vector256.LoadUnsafe(ref k, (nuint)column);
                     Vector256<float> kHi = Vector256.LoadUnsafe(ref k, (nuint)(column + width));
 
@@ -213,7 +484,7 @@ internal static class AttentionKernels
             float t0 = 0f, t1 = 0f, t2 = 0f, t3 = 0f;
             for (int d = 0; d < headDim; d++)
             {
-                float key = Unsafe.Add(ref k, (d * keyStride) + token);
+                float key = Unsafe.Add(ref k, kBase + (d * keyStride) + token);
                 t0 += Unsafe.Add(ref q, q0 + d) * key;
                 t1 += Unsafe.Add(ref q, q0 + headDim + d) * key;
                 t2 += Unsafe.Add(ref q, q0 + (2 * headDim) + d) * key;
@@ -234,6 +505,7 @@ internal static class AttentionKernels
         int headDim,
         ReadOnlySpan<float> keysT,
         int tokens,
+        int kBase,
         int keyStride,
         Span<float> scores,
         int scoreStride,
@@ -260,7 +532,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * keyStride) + token;
+                    int column = kBase + (d * keyStride) + token;
                     Vector512<float> v = Vector512.Create(Unsafe.Add(ref q, q0 + d));
                     z0 = Vector512.FusedMultiplyAdd(v, Vector512.LoadUnsafe(ref k, (nuint)column), z0);
                     z1 = Vector512.FusedMultiplyAdd(
@@ -287,7 +559,7 @@ internal static class AttentionKernels
 
                 for (int d = 0; d < headDim; d++)
                 {
-                    int column = (d * keyStride) + token;
+                    int column = kBase + (d * keyStride) + token;
                     Vector256<float> v = Vector256.Create(Unsafe.Add(ref q, q0 + d));
                     a0 = Vector256.FusedMultiplyAdd(v, Vector256.LoadUnsafe(ref k, (nuint)column), a0);
                     a1 = Vector256.FusedMultiplyAdd(
@@ -310,7 +582,7 @@ internal static class AttentionKernels
             float sum = 0f;
             for (int d = 0; d < headDim; d++)
             {
-                sum += Unsafe.Add(ref q, q0 + d) * Unsafe.Add(ref k, (d * keyStride) + token);
+                sum += Unsafe.Add(ref q, q0 + d) * Unsafe.Add(ref k, kBase + (d * keyStride) + token);
             }
 
             Unsafe.Add(ref s, s0 + token) = sum;
@@ -337,6 +609,27 @@ internal static class AttentionKernels
         // rows of 128 bytes — both inside L1 for the duration of the block.
         const int Block = 32;
 
+        if (AttentionTuning.TileMajor)
+        {
+            // [tile][headDim][ScoreColumns]: a tile of keys is one contiguous run.
+            int tile = AttentionTuning.ScoreColumns;
+            for (int t0 = 0; t0 < tokens; t0 += Block)
+            {
+                int tEnd = Math.Min(t0 + Block, tokens);
+                int tileBase = ((t0 / tile) * headDim * tile) + (t0 % tile);
+                for (int d = 0; d < headDim; d++)
+                {
+                    int column = tileBase + (d * tile) - t0;
+                    for (int t = t0; t < tEnd; t++)
+                    {
+                        destination[column + t] = source[(t * headDim) + d];
+                    }
+                }
+            }
+
+            return;
+        }
+
         for (int t0 = 0; t0 < tokens; t0 += Block)
         {
             int tEnd = Math.Min(t0 + Block, tokens);
@@ -351,6 +644,18 @@ internal static class AttentionKernels
         }
     }
 
+    /// <summary>Floats the transposed keys occupy, for either layout.</summary>
+    internal static int KeyBufferLength(int tokens, int headDim, int keyStride)
+    {
+        if (!AttentionTuning.TileMajor)
+        {
+            return headDim * keyStride;
+        }
+
+        int tile = AttentionTuning.ScoreColumns;
+        return ((tokens + tile - 1) / tile) * headDim * tile;
+    }
+
     /// <summary>Tokens one pass of the value kernel reduces over.</summary>
     /// <remarks>
     /// A chunk's slice of the values — <c>ChunkTokens x headDim</c> floats, 23 KB at a head width
@@ -358,7 +663,7 @@ internal static class AttentionKernels
     /// makes the sweeps free; sized for L2 instead, the kernel simply becomes L2-bound and gains
     /// nothing.
     /// </remarks>
-    private const int ChunkTokens = 80;
+    private static readonly int ChunkTokens = AttentionTuning.ChunkTokens;
 
     /// <summary>Query rows one pass of the value kernel accumulates.</summary>
     private const int ValueRows = 4;
