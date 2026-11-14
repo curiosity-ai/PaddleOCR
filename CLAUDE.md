@@ -1225,17 +1225,10 @@ unsigned shift the int8 path applies to its activations, on a CPU that has them.
 | pure throughput, twelve chains | 190-215 GMAC/s | 312-367 GMAC/s | 1.6-1.9x |
 | a 4x4 tile like `GemmInt8`'s, in L1 | 177-184 GMAC/s | 249-255 GMAC/s | **1.39-1.56x** |
 
-The tile is the number that transfers: 1.4x on the arithmetic of the int8 products, against the 3.1x
-the 256-bit tile already gave over the float32 one. What that is worth on a page is bounded by how
-much of it is those products: at a 1156-patch block, GEMM is about half of the tower (MLP 952 ms,
-qkv 369, output 168 of a pass of roughly 2.9 s) and at a 4900-patch block it is 21%, so **an
-estimated 5-10% of vision at ordinary block sizes and 4-6% at the largest, before the work that does
-not scale with the vector width** (quantising the activations, the row sums, the final reductions).
-That is an estimate from the isolated tile, not a measurement of the kernel, and the isolated tile
-over-promised before (item 5 under "Alignment and the worker team": 19% on the tile, 10% in place).
-Two constraints on building it: a 512-bit reduction vector is 64 bytes, and the MLP's second
-projection reduces over 4304, which is 67.25 of them, so that product needs a 256-bit tail; and the
-256-bit kernel stays for machines without `AvxVnni.V512`.
+The isolated tile said 1.4x, and **the kernel it was meant for did not get faster**: it was built
+(commits `7d0e46b` and the one after it) and is not in the tree. See the entry under "Things that
+looked like wins and were not". What survives is the finding that the tower's int8 products are not
+bound by the instruction at all.
 
 ### Attention at large blocks: what a 4900-patch block was spending
 
@@ -1457,6 +1450,36 @@ comment, and the two cold-start answers that did not work — and the generalise
   bit-identical**: the chunk is how the reduction over tokens is grouped, so changing it regroups
   the float32 sums (the output hash differs at 1100 tokens). 80 stays, and it is a numerical
   choice as much as a cache one.
+
+- **A 512-bit `GemmInt8` tile (`AvxVnni.V512`, new in .NET 11), a shuffle-tree reduction and a
+  row-blocked panel loop.** The isolated tile is 1.39-1.56x the 256-bit one (`tools/vnni`), so the
+  estimate was 5-10% of vision. Built: a 4x4 tile and a 4x1 tile on `Vector512`, the remainder of a
+  64-byte step on 256-bit vectors (the MLP's 4304-wide product has 16 bytes left over), the sixteen
+  horizontal sums per tile replaced by three `vphaddd` and an add a row, and the panel loop reordered so
+  each column group's weights are read from L2 once for a block of 20 activation rows instead of
+  again for every four. **All bit-identical** — the sums are integers, and the output hash over the
+  tower's, the projector's and the decoder's real shapes is the same in every variant — and pinned by an
+  exact-sum test at every remainder, which stays. **None of it is measurably faster:**
+
+  | | sum of best over eight real shapes, vs the old kernels |
+  | --- | --- |
+  | 256-bit tile, shuffle-tree reduction only | +1.3% .. -5.0% |
+  | 512-bit tile alone | -4.1% |
+  | row-blocked loop alone | -5.8% |
+  | 512-bit tile + blocking + reduction (three interleaved runs) | -10.3%, -5.8%, -3.6% |
+
+  Individual shapes ran from -17% to +11% in the same sittings, the 4304-wide product slower than the
+  old kernel in every new variant (+2% to +10%), and the host's spread on each figure was 10-40%.
+  End to end on the 150 dpi page, six interleaved rounds, markdown byte-identical: **page 18.97 s old,
+  19.25 s with the 256-bit tile, 19.03 s with the 512-bit one; vision 9.79 / 9.64 / 9.58 s**, inside
+  spreads of 11-21%. The reason is that the real kernel is nowhere near the tile's ceiling — about
+  205-420 GMAC/s over four threads on these shapes, 50-105 a thread, against 180 (256-bit) and 250
+  (512-bit) for the isolated tile in L1 — so a faster instruction has little to speed up. Row blocking
+  was the test of the obvious cause, weights re-read from L2 every four rows, and it recovered a few
+  percent, not the factor of two the gap allows; **what binds this kernel is not identified**. The
+  isolated tile over-promised for the second time (the outer-product tile was 19% in isolation and 10%
+  in place; this one 40% and under 5%): a tile measured with its operands in L1 says what the
+  instruction can do, not what the product around it does.
 
 ### Traps that make a SIMD microbenchmark lie
 

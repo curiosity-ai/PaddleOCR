@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics.X86;
 using PaddleOcrSharp.Core;
 
 namespace PaddleOcrSharp.Tests.Core;
@@ -94,10 +93,9 @@ public class GemmInt8Tests
     }
 
     /// <summary>
-    /// The 256-bit and 512-bit tiles add the same integers in different orders, so their sums must be
-    /// equal, and equal to a scalar sum, at every remainder a 64-byte step can leave: 0, 16, 32 and 48
-    /// bytes, and the model's own reduction lengths (1152, 1024, 3072, 4304 with a remainder of 16,
-    /// 4608).
+    /// The tiles' integer sums are exact: equal to a scalar sum at every remainder a 32-byte step can
+    /// leave (0 and 16 bytes) and at the model's own reduction lengths (1152, 1024, 3072, 4304 with a
+    /// remainder of 16, 4608), for random bytes and for the extremes, where a sum is largest.
     /// </summary>
     [Theory]
     [InlineData(16)]
@@ -113,9 +111,9 @@ public class GemmInt8Tests
     [InlineData(3072)]
     [InlineData(4304)]
     [InlineData(4608)]
-    public unsafe void WideAndNarrowTilesGiveTheSameIntegerSums(int k)
+    public unsafe void TilesGiveTheExactIntegerSums(int k)
     {
-        if (!GemmInt8.Available || !AvxVnni.V512.IsSupported)
+        if (!GemmInt8.Available)
         {
             return;
         }
@@ -147,33 +145,28 @@ public class GemmInt8Tests
                 }
             }
 
-            int[] narrow = new int[16], wide = new int[16];
+            int[] actual = new int[16];
             fixed (byte* px = xs)
             fixed (sbyte* pw = ws)
-            fixed (int* pn = narrow, pwide = wide)
+            fixed (int* pa = actual)
             {
-                GemmInt8.Tile4x4(px, k, pw, k, pn);
-                GemmInt8.Tile4x4Wide(px, k, pw, k, pwide);
+                GemmInt8.Tile4x4(px, k, pw, k, pa);
             }
 
-            Assert.Equal(expected, narrow);
-            Assert.Equal(expected, wide);
+            Assert.Equal(expected, actual);
 
             // Four rows against one weight row, the ragged-panel tile.
             for (int j = 0; j < 4; j++)
             {
-                int[] oneNarrow = new int[4], oneWide = new int[4];
+                int[] one = new int[4];
                 fixed (byte* px = xs)
                 fixed (sbyte* pw = ws)
-                fixed (int* pn = oneNarrow, pwide = oneWide)
+                fixed (int* po = one)
                 {
-                    GemmInt8.Tile4x1(px, k, pw + (j * k), pn);
-                    GemmInt8.Tile4x1Wide(px, k, pw + (j * k), pwide);
+                    GemmInt8.Tile4x1(px, k, pw + (j * k), po);
                 }
 
-                int[] column = Enumerable.Range(0, 4).Select(i => expected[(i * 4) + j]).ToArray();
-                Assert.Equal(column, oneNarrow);
-                Assert.Equal(column, oneWide);
+                Assert.Equal(Enumerable.Range(0, 4).Select(i => expected[(i * 4) + j]).ToArray(), one);
             }
         }
     }

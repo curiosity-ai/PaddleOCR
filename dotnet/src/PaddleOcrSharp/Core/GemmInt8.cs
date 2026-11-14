@@ -41,15 +41,6 @@ internal static unsafe class GemmInt8
     /// <summary>Whether the instruction exists here.</summary>
     internal static bool Available => AvxVnni.IsSupported;
 
-    /// <summary>
-    /// Whether the tiles run on 512-bit vectors (<c>AvxVnni.V512</c>, .NET 11). The sums are integers, so
-    /// the choice changes speed and nothing else; <c>PADDLEOCR_SHARP_INT8_WIDE=0</c> keeps the 256-bit
-    /// tile on a machine that has both.
-    /// </summary>
-    internal static readonly bool Wide = Simd.Use512
-        && AvxVnni.V512.IsSupported
-        && Environment.GetEnvironmentVariable("PADDLEOCR_SHARP_INT8_WIDE") != "0";
-
     /// <summary>Whether a product of <paramref name="rows"/> activation rows against <paramref name="weight"/> takes this path.</summary>
     internal static bool Applies(int rows, WeightMatrix weight) =>
         Available
@@ -156,69 +147,30 @@ internal static unsafe class GemmInt8
         fixed (float* sx = rowScales, sw = weightScales, py = y, pb = bias)
         {
             bool hasBias = !bias.IsEmpty;
-            bool wide = Wide;
             int paddedRows = (rows + 3) & ~3;
 
-            int blockRows = RowBlock(inner);
-
-            // A block of activation rows stays in L1 while every column group of the panel is run
-            // against it, and each group's weights are read from L2 once and reused by every four-row
-            // tile of the block: with the block one tile tall, as it was, a weight row was fetched
-            // again for every four activation rows.
-            for (int mb = 0; mb < paddedRows; mb += blockRows)
+            for (int m = 0; m < paddedRows; m += 4)
             {
-                int mEnd = Math.Min(paddedRows, mb + blockRows);
+                int live = Math.Min(4, rows - m);
+                byte* xm = px + ((long)m * inner);
 
                 int c = 0;
                 for (; c + 4 <= colCount; c += 4)
                 {
                     int n = colStart + c;
-                    sbyte* wn = (sbyte*)(pw + ((long)n * inner));
-                    for (int m = mb; m < mEnd; m += 4)
-                    {
-                        byte* xm = px + ((long)m * inner);
-                        if (wide)
-                        {
-                            Tile4x4Wide(xm, inner, wn, inner, sums);
-                        }
-                        else
-                        {
-                            Tile4x4(xm, inner, wn, inner, sums);
-                        }
-
-                        Store(sums, Math.Min(4, rows - m), 4, m, n, sx, sw, ws, py, cols, hasBias ? pb : null);
-                    }
+                    Tile4x4(xm, inner, (sbyte*)(pw + ((long)n * inner)), inner, sums);
+                    Store(sums, live, 4, m, n, sx, sw, ws, py, cols, hasBias ? pb : null);
                 }
 
                 for (; c < colCount; c++)
                 {
                     int n = colStart + c;
-                    sbyte* wn = (sbyte*)(pw + ((long)n * inner));
-                    for (int m = mb; m < mEnd; m += 4)
-                    {
-                        byte* xm = px + ((long)m * inner);
-                        if (wide)
-                        {
-                            Tile4x1Wide(xm, inner, wn, sums);
-                        }
-                        else
-                        {
-                            Tile4x1(xm, inner, wn, sums);
-                        }
-
-                        Store(sums, Math.Min(4, rows - m), 1, m, n, sx, sw, ws, py, cols, hasBias ? pb : null);
-                    }
+                    Tile4x1(xm, inner, (sbyte*)(pw + ((long)n * inner)), sums);
+                    Store(sums, live, 1, m, n, sx, sw, ws, py, cols, hasBias ? pb : null);
                 }
             }
         }
     }
-
-    /// <summary>Bytes of activations one block of rows may take: about half an L1, the rest being weights and outputs.</summary>
-    private static readonly int BlockBytes =
-        int.TryParse(Environment.GetEnvironmentVariable("PADDLEOCR_SHARP_INT8_XBYTES"), out int configured) ? configured : 24576;
-
-    /// <summary>Activation rows per block for a reduction of <paramref name="inner"/> bytes: a multiple of four, at least four.</summary>
-    private static int RowBlock(int inner) => Math.Max(4, (BlockBytes / inner) & ~3);
 
     /// <summary>Turns a tile's integer sums (<c>sums[i * columns + j]</c>) into outputs.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -239,11 +191,9 @@ internal static unsafe class GemmInt8
     }
 
     /// <summary>
-    /// Four activation rows against four weight rows on 256-bit vectors: sixteen int32 accumulators of
-    /// eight lanes, each step thirty-two bytes of each row. The reduction length is a multiple of
-    /// sixteen, not necessarily of thirty-two; a trailing sixteen are zero-extended to a full vector
-    /// so they accumulate in place. The sums are exact integers, so every kernel here gives the same
-    /// ones whatever order it adds them in.
+    /// Four activation rows against four weight rows: sixteen int32 accumulators of eight lanes, each
+    /// step thirty-two bytes of each row. The reduction length is not assumed to be a multiple of
+    /// thirty-two; a trailing sixteen are taken on 128-bit lanes.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void Tile4x4(byte* x, int k, sbyte* w, int stride, int* sums)
@@ -289,182 +239,74 @@ internal static unsafe class GemmInt8
             a33 = AvxVnni.MultiplyWideningAndAdd(a33, v, b3);
         }
 
+        sums[0] = Vector256.Sum(a00);
+        sums[1] = Vector256.Sum(a01);
+        sums[2] = Vector256.Sum(a02);
+        sums[3] = Vector256.Sum(a03);
+        sums[4] = Vector256.Sum(a10);
+        sums[5] = Vector256.Sum(a11);
+        sums[6] = Vector256.Sum(a12);
+        sums[7] = Vector256.Sum(a13);
+        sums[8] = Vector256.Sum(a20);
+        sums[9] = Vector256.Sum(a21);
+        sums[10] = Vector256.Sum(a22);
+        sums[11] = Vector256.Sum(a23);
+        sums[12] = Vector256.Sum(a30);
+        sums[13] = Vector256.Sum(a31);
+        sums[14] = Vector256.Sum(a32);
+        sums[15] = Vector256.Sum(a33);
+
         if (i < k)
         {
-            // One sixteen-byte step remains: 128-bit accumulators, reduced and added to the main sums.
+            // k is a multiple of sixteen: one 128-bit step remains.
+            Vector128<int> t00 = default, t01 = default, t02 = default, t03 = default;
+            Vector128<int> t10 = default, t11 = default, t12 = default, t13 = default;
+            Vector128<int> t20 = default, t21 = default, t22 = default, t23 = default;
+            Vector128<int> t30 = default, t31 = default, t32 = default, t33 = default;
+
             Vector128<sbyte> c0 = Vector128.Load(w0 + i);
             Vector128<sbyte> c1 = Vector128.Load(w1 + i);
             Vector128<sbyte> c2 = Vector128.Load(w2 + i);
             Vector128<sbyte> c3 = Vector128.Load(w3 + i);
 
             Vector128<byte> u = Vector128.Load(x0 + i);
-            Vector128<int> t00 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t01 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t02 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t03 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-
+            t00 = AvxVnni.MultiplyWideningAndAdd(t00, u, c0);
+            t01 = AvxVnni.MultiplyWideningAndAdd(t01, u, c1);
+            t02 = AvxVnni.MultiplyWideningAndAdd(t02, u, c2);
+            t03 = AvxVnni.MultiplyWideningAndAdd(t03, u, c3);
             u = Vector128.Load(x1 + i);
-            Vector128<int> t10 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t11 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t12 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t13 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-
+            t10 = AvxVnni.MultiplyWideningAndAdd(t10, u, c0);
+            t11 = AvxVnni.MultiplyWideningAndAdd(t11, u, c1);
+            t12 = AvxVnni.MultiplyWideningAndAdd(t12, u, c2);
+            t13 = AvxVnni.MultiplyWideningAndAdd(t13, u, c3);
             u = Vector128.Load(x2 + i);
-            Vector128<int> t20 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t21 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t22 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t23 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-
+            t20 = AvxVnni.MultiplyWideningAndAdd(t20, u, c0);
+            t21 = AvxVnni.MultiplyWideningAndAdd(t21, u, c1);
+            t22 = AvxVnni.MultiplyWideningAndAdd(t22, u, c2);
+            t23 = AvxVnni.MultiplyWideningAndAdd(t23, u, c3);
             u = Vector128.Load(x3 + i);
-            Vector128<int> t30 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t31 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t32 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t33 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-            Vector128.Store(ReduceFour(a00, a01, a02, a03) + ReduceFour128(t00, t01, t02, t03), sums + 0);
-            Vector128.Store(ReduceFour(a10, a11, a12, a13) + ReduceFour128(t10, t11, t12, t13), sums + 4);
-            Vector128.Store(ReduceFour(a20, a21, a22, a23) + ReduceFour128(t20, t21, t22, t23), sums + 8);
-            Vector128.Store(ReduceFour(a30, a31, a32, a33) + ReduceFour128(t30, t31, t32, t33), sums + 12);
-            return;
+            t30 = AvxVnni.MultiplyWideningAndAdd(t30, u, c0);
+            t31 = AvxVnni.MultiplyWideningAndAdd(t31, u, c1);
+            t32 = AvxVnni.MultiplyWideningAndAdd(t32, u, c2);
+            t33 = AvxVnni.MultiplyWideningAndAdd(t33, u, c3);
+
+            sums[0] += Vector128.Sum(t00);
+            sums[1] += Vector128.Sum(t01);
+            sums[2] += Vector128.Sum(t02);
+            sums[3] += Vector128.Sum(t03);
+            sums[4] += Vector128.Sum(t10);
+            sums[5] += Vector128.Sum(t11);
+            sums[6] += Vector128.Sum(t12);
+            sums[7] += Vector128.Sum(t13);
+            sums[8] += Vector128.Sum(t20);
+            sums[9] += Vector128.Sum(t21);
+            sums[10] += Vector128.Sum(t22);
+            sums[11] += Vector128.Sum(t23);
+            sums[12] += Vector128.Sum(t30);
+            sums[13] += Vector128.Sum(t31);
+            sums[14] += Vector128.Sum(t32);
+            sums[15] += Vector128.Sum(t33);
         }
-
-        Vector128.Store(ReduceFour(a00, a01, a02, a03), sums + 0);
-        Vector128.Store(ReduceFour(a10, a11, a12, a13), sums + 4);
-        Vector128.Store(ReduceFour(a20, a21, a22, a23), sums + 8);
-        Vector128.Store(ReduceFour(a30, a31, a32, a33), sums + 12);
-    }
-
-    /// <summary>
-    /// <see cref="Tile4x4"/> on 512-bit vectors (<c>AvxVnni.V512</c>, new in .NET 11): sixty-four bytes of
-    /// each row a step, so half as many steps for the same arithmetic. What does not fill a 64-byte
-    /// step — sixteen, thirty-two or forty-eight bytes — runs on 256-bit vectors after the accumulators
-    /// are folded to that width, which is also where the reduction starts. Integer sums: bit-identical
-    /// to the 256-bit tile.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void Tile4x4Wide(byte* x, int k, sbyte* w, int stride, int* sums)
-    {
-        byte* x0 = x, x1 = x + k, x2 = x + (2L * k), x3 = x + (3L * k);
-        sbyte* w0 = w, w1 = w + stride, w2 = w + (2L * stride), w3 = w + (3L * stride);
-
-        Vector512<int> a00 = default, a01 = default, a02 = default, a03 = default;
-        Vector512<int> a10 = default, a11 = default, a12 = default, a13 = default;
-        Vector512<int> a20 = default, a21 = default, a22 = default, a23 = default;
-        Vector512<int> a30 = default, a31 = default, a32 = default, a33 = default;
-
-        int i = 0;
-        for (; i + 64 <= k; i += 64)
-        {
-            Vector512<sbyte> b0 = Vector512.Load(w0 + i);
-            Vector512<sbyte> b1 = Vector512.Load(w1 + i);
-            Vector512<sbyte> b2 = Vector512.Load(w2 + i);
-            Vector512<sbyte> b3 = Vector512.Load(w3 + i);
-
-            Vector512<byte> v = Vector512.Load(x0 + i);
-            a00 = AvxVnni.V512.MultiplyWideningAndAdd(a00, v, b0);
-            a01 = AvxVnni.V512.MultiplyWideningAndAdd(a01, v, b1);
-            a02 = AvxVnni.V512.MultiplyWideningAndAdd(a02, v, b2);
-            a03 = AvxVnni.V512.MultiplyWideningAndAdd(a03, v, b3);
-
-            v = Vector512.Load(x1 + i);
-            a10 = AvxVnni.V512.MultiplyWideningAndAdd(a10, v, b0);
-            a11 = AvxVnni.V512.MultiplyWideningAndAdd(a11, v, b1);
-            a12 = AvxVnni.V512.MultiplyWideningAndAdd(a12, v, b2);
-            a13 = AvxVnni.V512.MultiplyWideningAndAdd(a13, v, b3);
-
-            v = Vector512.Load(x2 + i);
-            a20 = AvxVnni.V512.MultiplyWideningAndAdd(a20, v, b0);
-            a21 = AvxVnni.V512.MultiplyWideningAndAdd(a21, v, b1);
-            a22 = AvxVnni.V512.MultiplyWideningAndAdd(a22, v, b2);
-            a23 = AvxVnni.V512.MultiplyWideningAndAdd(a23, v, b3);
-
-            v = Vector512.Load(x3 + i);
-            a30 = AvxVnni.V512.MultiplyWideningAndAdd(a30, v, b0);
-            a31 = AvxVnni.V512.MultiplyWideningAndAdd(a31, v, b1);
-            a32 = AvxVnni.V512.MultiplyWideningAndAdd(a32, v, b2);
-            a33 = AvxVnni.V512.MultiplyWideningAndAdd(a33, v, b3);
-        }
-
-        // Fold to 256 bits; the remainder, if any, accumulates there.
-        Vector256<int> f00 = a00.GetLower() + a00.GetUpper(), f01 = a01.GetLower() + a01.GetUpper(), f02 = a02.GetLower() + a02.GetUpper(), f03 = a03.GetLower() + a03.GetUpper();
-        Vector256<int> f10 = a10.GetLower() + a10.GetUpper(), f11 = a11.GetLower() + a11.GetUpper(), f12 = a12.GetLower() + a12.GetUpper(), f13 = a13.GetLower() + a13.GetUpper();
-        Vector256<int> f20 = a20.GetLower() + a20.GetUpper(), f21 = a21.GetLower() + a21.GetUpper(), f22 = a22.GetLower() + a22.GetUpper(), f23 = a23.GetLower() + a23.GetUpper();
-        Vector256<int> f30 = a30.GetLower() + a30.GetUpper(), f31 = a31.GetLower() + a31.GetUpper(), f32 = a32.GetLower() + a32.GetUpper(), f33 = a33.GetLower() + a33.GetUpper();
-
-        if (i + 32 <= k)
-        {
-            Vector256<sbyte> b0 = Vector256.Load(w0 + i);
-            Vector256<sbyte> b1 = Vector256.Load(w1 + i);
-            Vector256<sbyte> b2 = Vector256.Load(w2 + i);
-            Vector256<sbyte> b3 = Vector256.Load(w3 + i);
-
-            Vector256<byte> v = Vector256.Load(x0 + i);
-            f00 = AvxVnni.MultiplyWideningAndAdd(f00, v, b0);
-            f01 = AvxVnni.MultiplyWideningAndAdd(f01, v, b1);
-            f02 = AvxVnni.MultiplyWideningAndAdd(f02, v, b2);
-            f03 = AvxVnni.MultiplyWideningAndAdd(f03, v, b3);
-
-            v = Vector256.Load(x1 + i);
-            f10 = AvxVnni.MultiplyWideningAndAdd(f10, v, b0);
-            f11 = AvxVnni.MultiplyWideningAndAdd(f11, v, b1);
-            f12 = AvxVnni.MultiplyWideningAndAdd(f12, v, b2);
-            f13 = AvxVnni.MultiplyWideningAndAdd(f13, v, b3);
-
-            v = Vector256.Load(x2 + i);
-            f20 = AvxVnni.MultiplyWideningAndAdd(f20, v, b0);
-            f21 = AvxVnni.MultiplyWideningAndAdd(f21, v, b1);
-            f22 = AvxVnni.MultiplyWideningAndAdd(f22, v, b2);
-            f23 = AvxVnni.MultiplyWideningAndAdd(f23, v, b3);
-
-            v = Vector256.Load(x3 + i);
-            f30 = AvxVnni.MultiplyWideningAndAdd(f30, v, b0);
-            f31 = AvxVnni.MultiplyWideningAndAdd(f31, v, b1);
-            f32 = AvxVnni.MultiplyWideningAndAdd(f32, v, b2);
-            f33 = AvxVnni.MultiplyWideningAndAdd(f33, v, b3);
-            i += 32;
-        }
-
-        if (i < k)
-        {
-            // One sixteen-byte step remains: 128-bit accumulators, reduced and added to the main sums.
-            Vector128<sbyte> c0 = Vector128.Load(w0 + i);
-            Vector128<sbyte> c1 = Vector128.Load(w1 + i);
-            Vector128<sbyte> c2 = Vector128.Load(w2 + i);
-            Vector128<sbyte> c3 = Vector128.Load(w3 + i);
-
-            Vector128<byte> u = Vector128.Load(x0 + i);
-            Vector128<int> t00 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t01 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t02 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t03 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-
-            u = Vector128.Load(x1 + i);
-            Vector128<int> t10 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t11 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t12 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t13 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-
-            u = Vector128.Load(x2 + i);
-            Vector128<int> t20 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t21 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t22 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t23 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-
-            u = Vector128.Load(x3 + i);
-            Vector128<int> t30 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c0);
-            Vector128<int> t31 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c1);
-            Vector128<int> t32 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c2);
-            Vector128<int> t33 = AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, u, c3);
-            Vector128.Store(ReduceFour(f00, f01, f02, f03) + ReduceFour128(t00, t01, t02, t03), sums + 0);
-            Vector128.Store(ReduceFour(f10, f11, f12, f13) + ReduceFour128(t10, t11, t12, t13), sums + 4);
-            Vector128.Store(ReduceFour(f20, f21, f22, f23) + ReduceFour128(t20, t21, t22, t23), sums + 8);
-            Vector128.Store(ReduceFour(f30, f31, f32, f33) + ReduceFour128(t30, t31, t32, t33), sums + 12);
-            return;
-        }
-
-        Vector128.Store(ReduceFour(f00, f01, f02, f03), sums + 0);
-        Vector128.Store(ReduceFour(f10, f11, f12, f13), sums + 4);
-        Vector128.Store(ReduceFour(f20, f21, f22, f23), sums + 8);
-        Vector128.Store(ReduceFour(f30, f31, f32, f33), sums + 12);
     }
 
     /// <summary>Four activation rows against one weight row, for the last few columns of a ragged panel.</summary>
@@ -484,75 +326,18 @@ internal static unsafe class GemmInt8
             a3 = AvxVnni.MultiplyWideningAndAdd(a3, Vector256.Load(x3 + i), b);
         }
 
-        if (i < k)
-        {
-            Vector256<sbyte> c = Vector256.Create(Vector128.Load(w + i), Vector128<sbyte>.Zero);
-            a0 = AvxVnni.MultiplyWideningAndAdd(a0, Vector256.Create(Vector128.Load(x0 + i), Vector128<byte>.Zero), c);
-            a1 = AvxVnni.MultiplyWideningAndAdd(a1, Vector256.Create(Vector128.Load(x1 + i), Vector128<byte>.Zero), c);
-            a2 = AvxVnni.MultiplyWideningAndAdd(a2, Vector256.Create(Vector128.Load(x2 + i), Vector128<byte>.Zero), c);
-            a3 = AvxVnni.MultiplyWideningAndAdd(a3, Vector256.Create(Vector128.Load(x3 + i), Vector128<byte>.Zero), c);
-        }
-
-        Vector128.Store(ReduceFour(a0, a1, a2, a3), sums);
-    }
-
-    /// <summary><see cref="Tile4x1"/> on 512-bit vectors.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void Tile4x1Wide(byte* x, int k, sbyte* w, int* sums)
-    {
-        byte* x0 = x, x1 = x + k, x2 = x + (2L * k), x3 = x + (3L * k);
-        Vector512<int> a0 = default, a1 = default, a2 = default, a3 = default;
-
-        int i = 0;
-        for (; i + 64 <= k; i += 64)
-        {
-            Vector512<sbyte> b = Vector512.Load(w + i);
-            a0 = AvxVnni.V512.MultiplyWideningAndAdd(a0, Vector512.Load(x0 + i), b);
-            a1 = AvxVnni.V512.MultiplyWideningAndAdd(a1, Vector512.Load(x1 + i), b);
-            a2 = AvxVnni.V512.MultiplyWideningAndAdd(a2, Vector512.Load(x2 + i), b);
-            a3 = AvxVnni.V512.MultiplyWideningAndAdd(a3, Vector512.Load(x3 + i), b);
-        }
-
-        Vector256<int> f0 = a0.GetLower() + a0.GetUpper(), f1 = a1.GetLower() + a1.GetUpper();
-        Vector256<int> f2 = a2.GetLower() + a2.GetUpper(), f3 = a3.GetLower() + a3.GetUpper();
-
-        if (i + 32 <= k)
-        {
-            Vector256<sbyte> b = Vector256.Load(w + i);
-            f0 = AvxVnni.MultiplyWideningAndAdd(f0, Vector256.Load(x0 + i), b);
-            f1 = AvxVnni.MultiplyWideningAndAdd(f1, Vector256.Load(x1 + i), b);
-            f2 = AvxVnni.MultiplyWideningAndAdd(f2, Vector256.Load(x2 + i), b);
-            f3 = AvxVnni.MultiplyWideningAndAdd(f3, Vector256.Load(x3 + i), b);
-            i += 32;
-        }
+        sums[0] = Vector256.Sum(a0);
+        sums[1] = Vector256.Sum(a1);
+        sums[2] = Vector256.Sum(a2);
+        sums[3] = Vector256.Sum(a3);
 
         if (i < k)
         {
-            Vector256<sbyte> c = Vector256.Create(Vector128.Load(w + i), Vector128<sbyte>.Zero);
-            f0 = AvxVnni.MultiplyWideningAndAdd(f0, Vector256.Create(Vector128.Load(x0 + i), Vector128<byte>.Zero), c);
-            f1 = AvxVnni.MultiplyWideningAndAdd(f1, Vector256.Create(Vector128.Load(x1 + i), Vector128<byte>.Zero), c);
-            f2 = AvxVnni.MultiplyWideningAndAdd(f2, Vector256.Create(Vector128.Load(x2 + i), Vector128<byte>.Zero), c);
-            f3 = AvxVnni.MultiplyWideningAndAdd(f3, Vector256.Create(Vector128.Load(x3 + i), Vector128<byte>.Zero), c);
+            Vector128<sbyte> c = Vector128.Load(w + i);
+            sums[0] += Vector128.Sum(AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, Vector128.Load(x0 + i), c));
+            sums[1] += Vector128.Sum(AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, Vector128.Load(x1 + i), c));
+            sums[2] += Vector128.Sum(AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, Vector128.Load(x2 + i), c));
+            sums[3] += Vector128.Sum(AvxVnni.MultiplyWideningAndAdd(Vector128<int>.Zero, Vector128.Load(x3 + i), c));
         }
-
-        Vector128.Store(ReduceFour(f0, f1, f2, f3), sums);
-    }
-
-    /// <summary>
-    /// The horizontal sums of four accumulators, as one vector: <c>[Σa, Σb, Σc, Σd]</c>. Three
-    /// <c>vphaddd</c> and one add, where four separate <see cref="Vector256.Sum{T}"/> calls are about
-    /// five times the instructions — and a tile of sixteen accumulators pays for this once per tile.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<int> ReduceFour128(Vector128<int> a, Vector128<int> b, Vector128<int> c, Vector128<int> d) =>
-        Ssse3.HorizontalAdd(Ssse3.HorizontalAdd(a, b), Ssse3.HorizontalAdd(c, d));
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<int> ReduceFour(Vector256<int> a, Vector256<int> b, Vector256<int> c, Vector256<int> d)
-    {
-        Vector256<int> ab = Avx2.HorizontalAdd(a, b);
-        Vector256<int> cd = Avx2.HorizontalAdd(c, d);
-        Vector256<int> abcd = Avx2.HorizontalAdd(ab, cd);
-        return abcd.GetLower() + abcd.GetUpper();
     }
 }
