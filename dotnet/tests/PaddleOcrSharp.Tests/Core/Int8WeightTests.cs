@@ -194,7 +194,7 @@ public class Int8WeightTests
                 Assert.Equal(DType.BFloat16, plain.Matrix("layer.weight", WeightRole.Decoder).Dtype);
             }
 
-            using (WeightStore asked = WeightStore.Open(path, WeightQuantization.Int8))
+            using (WeightStore asked = WeightStore.Open(path, WeightQuantization.Int8Compute))
             {
                 Assert.Equal(DType.Int8, asked.Matrix("layer.weight", WeightRole.Decoder).Dtype);
                 Assert.Equal(DType.BFloat16, asked.Matrix("layer.weight").Dtype);
@@ -212,7 +212,7 @@ public class Int8WeightTests
     /// </summary>
     [Theory]
     [InlineData(WeightQuantization.None)]
-    [InlineData(WeightQuantization.Int8)]
+    [InlineData(WeightQuantization.Int8Compute)]
     public void AStoredInt8CheckpointIsReadAsStored(WeightQuantization asked)
     {
         const int Rows = 12, Cols = 384;

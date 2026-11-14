@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using PaddleOcrSharp.Download;
+using PaddleOcrSharp.Models;
 
 namespace PaddleOcrSharp.Tests.Download;
 
@@ -192,6 +193,111 @@ public class ModelDownloaderTests : IDisposable
         Assert.Equal("pp-doclayoutv3", ModelCatalog.PpDocLayoutV3.RemotePath);
         Assert.Equal("pp-lcnet-x1-0-doc-ori", ModelCatalog.DocOrientationClassifier.RemotePath);
         Assert.Equal("uvdoc", ModelCatalog.DocUnwarping.RemotePath);
+    }
+
+    /// <summary>
+    /// The int8 checkpoint differs from the original in one file, so the mirror holds one file
+    /// under <c>int8-compute/</c> and the descriptor sends every other file to the original's
+    /// directory. Pinned as URLs, because a wrong one is a download that fails on first use.
+    /// </summary>
+    [Fact]
+    public void Int8ComputeModelTakesOnlyItsWeightsFromItsOwnDirectory()
+    {
+        using var downloader = new ModelDownloader(
+            new HttpClient(new StubHandler()), ownsClient: true, _cache, "https://models.example");
+        ModelDescriptor model = ModelCatalog.PaddleOcrVL16Int8Compute;
+
+        Assert.Equal("PaddleOCR-VL-1.6-int8-compute", model.Name);
+        Assert.Equal(
+            model.Files.Select(file => file.Path),
+            ModelCatalog.PaddleOcrVL16.Files.Select(file => file.Path));
+
+        var urls = model.Files.ToDictionary(file => file.Path, file => downloader.UrlFor(model, file));
+        Assert.Equal(
+            "https://models.example/paddleocr-vl/int8-compute/model.safetensors", urls["model.safetensors"]);
+        Assert.Equal("https://models.example/paddleocr-vl/config.json", urls["config.json"]);
+        Assert.Equal("https://models.example/paddleocr-vl/tokenizer.json", urls["tokenizer.json"]);
+        Assert.Single(urls, pair => pair.Value.Contains("int8-compute", StringComparison.Ordinal));
+
+        // Required-ness is carried over, and the original is left as it was.
+        Assert.Equal(
+            ModelCatalog.PaddleOcrVL16.Files.Select(file => file.Required),
+            model.Files.Select(file => file.Required));
+        Assert.Null(ModelCatalog.PaddleOcrVL16.Files.Single(file => file.Path == "model.safetensors").RemotePath);
+        Assert.NotEqual(downloader.DirectoryFor(ModelCatalog.PaddleOcrVL16), downloader.DirectoryFor(model));
+    }
+
+    [Fact]
+    public void QuantizationPicksTheMatchingCheckpoint()
+    {
+        Assert.Same(ModelCatalog.PaddleOcrVL16, ModelCatalog.VisionLanguageFor(WeightQuantization.None));
+        Assert.Same(
+            ModelCatalog.PaddleOcrVL16Int8Compute,
+            ModelCatalog.VisionLanguageFor(WeightQuantization.Int8Compute));
+        Assert.Same(
+            ModelCatalog.PaddleOcrVL16Int8Compute,
+            ModelCatalog.Find("paddleocr-vl-1.6-int8-compute"));
+    }
+
+    /// <summary>A file with its own remote directory is requested from it, and the rest from the model's.</summary>
+    [Fact]
+    public async Task PerFileRemotePathIsUsedForThatFileOnly()
+    {
+        var handler = new StubHandler
+        {
+            Files =
+            {
+                ["config.json"] = "{}"u8.ToArray(),
+                ["weights.bin"] = new byte[300],
+            },
+        };
+
+        using var downloader = new ModelDownloader(
+            new HttpClient(handler), ownsClient: true, _cache, "https://models.example");
+        var model = new ModelDescriptor(
+            "stub",
+            "base",
+            [new ModelFile("config.json"), new ModelFile("weights.bin", RemotePath: "base/variant")]);
+
+        string directory = await downloader.EnsureAsync(model, null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(300, new FileInfo(Path.Combine(directory, "weights.bin")).Length);
+        Assert.Contains("https://models.example/base/config.json", handler.Requests);
+        Assert.Contains("https://models.example/base/variant/weights.bin", handler.Requests);
+        Assert.DoesNotContain("https://models.example/base/weights.bin", handler.Requests);
+        Assert.True(downloader.IsComplete(model));
+    }
+
+    /// <summary>
+    /// The mirror answers a missing object with <c>200</c> and the text <c>Object Not Found</c>.
+    /// An optional file must be skipped, not cached as that text, and a required one must fail.
+    /// </summary>
+    [Fact]
+    public async Task MirrorsOkWithObjectNotFoundCountsAsMissing()
+    {
+        var handler = new StubHandler
+        {
+            Files =
+            {
+                ["a.json"] = "{}"u8.ToArray(),
+                ["optional.json"] = "Object Not Found"u8.ToArray(),
+                ["required.json"] = "Object Not Found"u8.ToArray(),
+            },
+        };
+
+        using var downloader = new ModelDownloader(new HttpClient(handler), ownsClient: true, _cache, "https://stub");
+        var optional = new ModelDescriptor(
+            "stub", "stub", [new ModelFile("a.json"), new ModelFile("optional.json", Required: false)]);
+
+        string directory = await downloader.EnsureAsync(optional, null, TestContext.Current.CancellationToken);
+        Assert.True(File.Exists(Path.Combine(directory, "a.json")));
+        Assert.False(File.Exists(Path.Combine(directory, "optional.json")));
+        Assert.False(File.Exists(Path.Combine(directory, "optional.json.part")));
+
+        var required = new ModelDescriptor("stub-required", "stub", [new ModelFile("required.json")]);
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
+            downloader.EnsureAsync(required, null, TestContext.Current.CancellationToken));
+        Assert.False(downloader.IsComplete(required));
     }
 
     [Fact]

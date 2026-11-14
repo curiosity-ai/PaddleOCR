@@ -1,6 +1,11 @@
-"""Write a PaddleOCR-VL checkpoint whose weights are stored as int8 with group scales.
+"""Write a PaddleOCR-VL checkpoint whose weights are stored as int8.
 
 Usage: quantize_checkpoint.py <out_dir> [--components dec|all] [--group 128|row] [--source <checkpoint_dir>]
+
+With no options this writes the checkpoint `--quantization int8-compute` runs from, the one published
+at https://models.curiosity.ai/paddleocr-vl/int8-compute/model.safetensors: every projection of the
+tower, the projector and the decoder, one scale per output row. The other combinations are what the
+experiments in CLAUDE.md compared; the library only ships and downloads the default.
 
   dec   the decoder's seven projections per layer and lm_head (the bytes a decode step streams)
   all   those, plus the vision tower's projections and the projector
@@ -9,7 +14,7 @@ For every quantised tensor `name` (bfloat16, [rows, cols]) the file holds `name`
 and `name.scale` as F32 [rows, cols / 128]: symmetric, scale = max|w| / 127 over each group of 128
 consecutive columns, values rounded to nearest even and clamped to [-127, 127]. Everything else —
 norms, biases, embeddings, position embeddings — is copied unchanged. This is the same arithmetic as
-the library's on-the-fly path (`--quantization int8`), in float32 throughout, so the two agree
+the library's on-the-fly path (`--quantization int8-compute`), in float32 throughout, so the two agree
 byte for byte. The config, tokenizer and other small files are copied beside it.
 
 --group row stores one scale per output row instead of one per 128 columns. It is what an
@@ -44,8 +49,8 @@ def quantize(w, mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
-    ap.add_argument("--components", choices=("dec", "all"), default="dec")
-    ap.add_argument("--group", choices=("128", "row"), default="128")
+    ap.add_argument("--components", choices=("dec", "all"), default="all")
+    ap.add_argument("--group", choices=("128", "row"), default="row")
     ap.add_argument("--source", default=os.path.expanduser("~/.cache/paddleocr-sharp/PaddleOCR-VL-1.6"))
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)

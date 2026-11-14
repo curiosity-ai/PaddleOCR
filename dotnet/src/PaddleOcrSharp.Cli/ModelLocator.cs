@@ -42,7 +42,7 @@ public static class ModelLocator
     }
 
     /// <summary>
-    /// Reads how the language model's weights should be held: <c>--quantization none|int8|int8-compute</c>, or the
+    /// Reads how the model's weights should be held: <c>--quantization none|int8-compute</c>, or the
     /// <c>PADDLEOCR_SHARP_QUANTIZATION</c> environment variable, or none.
     /// </summary>
     public static WeightQuantization QuantizationFrom(CommandLine command)
@@ -53,17 +53,12 @@ public static class ModelLocator
             return WeightQuantization.None;
         }
 
-        if (text.Equals("int8", StringComparison.OrdinalIgnoreCase))
-        {
-            return WeightQuantization.Int8;
-        }
-
         if (text.Equals("int8-compute", StringComparison.OrdinalIgnoreCase))
         {
             return WeightQuantization.Int8Compute;
         }
 
-        throw new ArgumentException($"Unknown quantization '{text}'. Use none, int8 or int8-compute.");
+        throw new ArgumentException($"Unknown quantization '{text}'. Use none or int8-compute.");
     }
 
     /// <summary>
@@ -109,6 +104,11 @@ public static class ModelLocator
     /// <summary>
     /// Finds the VL checkpoint, downloading it when <paramref name="allowDownload"/> is set.
     /// </summary>
+    /// <remarks>
+    /// Which checkpoint is fetched follows <c>--quantization</c>: <c>int8-compute</c> downloads the
+    /// pre-quantised one (1.1 GB) rather than the bfloat16 one (1.9 GB) it would otherwise quantise
+    /// on every load. An explicit <c>--model-dir</c> is used as it is.
+    /// </remarks>
     public static async Task<string> ResolveVLAsync(
         CommandLine command,
         bool allowDownload,
@@ -129,7 +129,7 @@ public static class ModelLocator
         }
 
         using var downloader = new ModelDownloader(command.Get("cache"), command.Get("endpoint"));
-        ModelDescriptor model = ModelCatalog.PaddleOcrVL16;
+        ModelDescriptor model = ModelCatalog.VisionLanguageFor(QuantizationFrom(command));
 
         if (downloader.IsComplete(model))
         {

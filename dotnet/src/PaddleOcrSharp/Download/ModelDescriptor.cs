@@ -3,7 +3,13 @@ namespace PaddleOcrSharp.Download;
 /// <summary>One file inside a model directory.</summary>
 /// <param name="Path">Path relative to the model's directory.</param>
 /// <param name="Required">Whether the model cannot be used without it.</param>
-public readonly record struct ModelFile(string Path, bool Required = true);
+/// <param name="RemotePath">
+/// Directory under the endpoint to fetch this one file from, when it is not the model's own
+/// <see cref="ModelDescriptor.RemotePath"/>. A variant that differs from another model in a
+/// single file — a quantised checkpoint beside the same tokenizer and configs — names only that
+/// file here instead of mirroring a second copy of the rest.
+/// </param>
+public readonly record struct ModelFile(string Path, bool Required = true, string? RemotePath = null);
 
 /// <summary>A downloadable model.</summary>
 /// <param name="Name">Short local name, also the cache directory.</param>
@@ -48,6 +54,34 @@ public static class ModelCatalog
         ]);
 
     /// <summary>
+    /// <see cref="PaddleOcrVL16"/> with its weights replaced by the int8 checkpoint that
+    /// <see cref="Models.WeightQuantization.Int8Compute"/> runs from: per-row scales, tower and
+    /// decoder both quantised, 1.1 GB against 1.9 GB. Only <c>model.safetensors</c> differs, so
+    /// it is the only file the mirror holds under <c>paddleocr-vl/int8-compute/</c>; the
+    /// tokenizer and the configs are the original model's and are fetched from there.
+    /// </summary>
+    public static ModelDescriptor PaddleOcrVL16Int8Compute { get; } = new(
+        "PaddleOCR-VL-1.6-int8-compute",
+        PaddleOcrVL16.RemotePath,
+        [
+            .. PaddleOcrVL16.Files.Select(file => file.Path == "model.safetensors"
+                ? file with { RemotePath = $"{PaddleOcrVL16.RemotePath}/int8-compute" }
+                : file),
+        ]);
+
+    /// <summary>
+    /// The VL checkpoint that matches <paramref name="quantization"/>: the original for
+    /// <see cref="Models.WeightQuantization.None"/>, the pre-quantised one for
+    /// <see cref="Models.WeightQuantization.Int8Compute"/>.
+    /// </summary>
+    public static ModelDescriptor VisionLanguageFor(Models.WeightQuantization quantization) => quantization switch
+    {
+        Models.WeightQuantization.None => PaddleOcrVL16,
+        Models.WeightQuantization.Int8Compute => PaddleOcrVL16Int8Compute,
+        _ => throw new ArgumentOutOfRangeException(nameof(quantization), quantization, null),
+    };
+
+    /// <summary>
     /// The RT-DETR layout detector used by the 1.6 pipeline. Mirrors
     /// <c>PaddlePaddle/PP-DocLayoutV3</c>.
     /// </summary>
@@ -90,7 +124,7 @@ public static class ModelCatalog
 
     /// <summary>Every model the catalogue knows about.</summary>
     public static IReadOnlyList<ModelDescriptor> All { get; } =
-        [PaddleOcrVL16, PpDocLayoutV3, DocOrientationClassifier, DocUnwarping];
+        [PaddleOcrVL16, PaddleOcrVL16Int8Compute, PpDocLayoutV3, DocOrientationClassifier, DocUnwarping];
 
     /// <summary>Finds a model by <see cref="ModelDescriptor.Name"/>, case-insensitively.</summary>
     public static ModelDescriptor? Find(string name) =>

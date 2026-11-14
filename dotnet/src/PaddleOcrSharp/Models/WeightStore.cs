@@ -59,7 +59,7 @@ public sealed class WeightStore : IDisposable
     /// <remarks>
     /// A tensor stored as int8 is read with its scales, which sit beside it as <c>name.scale</c>,
     /// whatever the store was opened with. A bfloat16 one is quantised as it is read when the
-    /// store asks for <see cref="WeightQuantization.Int8"/> and the caller says it may be.
+    /// store asks for <see cref="WeightQuantization.Int8Compute"/> and the caller says it may be.
     /// </remarks>
     /// <param name="name">The parameter name.</param>
     /// <param name="role">What the weight is for, which decides whether this store may quantise it on load.</param>
@@ -78,24 +78,14 @@ public sealed class WeightStore : IDisposable
             return compute && groups == 1 ? stored.WithComputeInt8() : stored;
         }
 
-        bool wanted = role switch
-        {
-            WeightRole.Decoder => _quantization != WeightQuantization.None,
-            WeightRole.Vision => compute,
-            _ => false,
-        };
-
-        if (wanted && tensor.Dtype == DType.BFloat16 && tensor.Shape.Length == 2)
+        if (compute && role != WeightRole.Other && tensor.Dtype == DType.BFloat16 && tensor.Shape.Length == 2)
         {
             return _quantized.GetOrAdd(
                 name,
                 static (_, state) =>
-                {
-                    // Integer arithmetic wants one scale per row; weight-only int8 keeps groups of 128.
-                    WeightMatrix q = state.Tensor.AsMatrix().QuantizeInt8(state.Compute ? state.Tensor.Shape[1] : 0);
-                    return state.Compute ? q.WithComputeInt8() : q;
-                },
-                (Tensor: tensor, Compute: compute));
+                    // Integer arithmetic wants one scale per row.
+                    state.AsMatrix().QuantizeInt8(state.Shape[1]).WithComputeInt8(),
+                tensor);
         }
 
         return tensor.AsMatrix();

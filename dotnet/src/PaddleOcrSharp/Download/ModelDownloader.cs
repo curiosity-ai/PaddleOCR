@@ -102,6 +102,10 @@ public sealed class ModelDownloader : IDisposable
         return directory;
     }
 
+    /// <summary>The address <paramref name="file"/> of <paramref name="model"/> is fetched from.</summary>
+    public string UrlFor(ModelDescriptor model, ModelFile file) =>
+        $"{Endpoint}/{file.RemotePath ?? model.RemotePath}/{file.Path}";
+
     private async Task FetchAsync(
         ModelDescriptor model,
         ModelFile file,
@@ -112,7 +116,7 @@ public sealed class ModelDownloader : IDisposable
         string target = Path.Combine(directory, file.Path);
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
 
-        string url = $"{Endpoint}/{model.RemotePath}/{file.Path}";
+        string url = UrlFor(model, file);
         RemoteFileInfo? remote = await HeadAsync(url, cancellationToken).ConfigureAwait(false);
 
         if (File.Exists(target))
@@ -201,7 +205,34 @@ public sealed class ModelDownloader : IDisposable
             throw new IOException($"'{file.Path}' downloaded {actual} bytes but {expected} were expected.");
         }
 
+        if (IsMissingObjectMarker(partial))
+        {
+            File.Delete(partial);
+            throw new HttpRequestException($"'{url}' does not exist on the mirror.");
+        }
+
         File.Move(partial, target, overwrite: true);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> holds the mirror's answer for an object it does not have.
+    /// The mirror's front end replies <c>200</c> with the text <c>Object Not Found</c> rather than
+    /// <c>404</c>, so a status code cannot tell a missing file from a present one, and without this
+    /// an absent optional file would be cached as a sixteen-byte text file the loader then fails
+    /// to parse.
+    /// </summary>
+    private static bool IsMissingObjectMarker(string path)
+    {
+        ReadOnlySpan<byte> marker = "Object Not Found"u8;
+        if (new FileInfo(path).Length != marker.Length)
+        {
+            return false;
+        }
+
+        Span<byte> head = stackalloc byte[16];
+        using FileStream stream = File.OpenRead(path);
+        return stream.ReadAtLeast(head, head.Length, throwOnEndOfStream: false) == head.Length
+            && head.SequenceEqual(marker);
     }
 
     private async Task<RemoteFileInfo?> HeadAsync(string url, CancellationToken cancellationToken)
