@@ -1038,6 +1038,27 @@ the GEMMs are about two thirds of the tower and the tower is a bit over half of 
 12.3 -> 11.6 s, layout convolutions 957-1103 -> 862-959 ms. A projection of 10% for the whole page,
 made from the isolated kernel, came out at about half that.
 
+**Why the page gains about a third of what the kernel does.** The 19% on the tower's MLP shape
+becomes 10% of the tower's MLP stage in place (stage medians, dot against outer: MLP 2112 -> 1899
+ms, qkv 879 -> 840, out 300 -> 280), for two reasons. The activations are repacked on every call,
+and three projections that share one input repack it three times: 4-5% of the GEMM time, 3% of the
+tower, measured with a temporary stopwatch. The rest of the gap was not isolated; the harness calls
+one matrix repeatedly, so its weights sit in L3, where the tower streams each layer's from memory.
+And the tile only reaches half of a page. At 150 dpi, estimated from the tower's and the prefill's
+stage profiles (GEMM 67% of the tower, 71% of the prefill, attention 24% and 20%):
+
+| | s | GEMM tile | the rest |
+| --- | --- | --- | --- |
+| vision | 12.0 | 8.0 | attention 2.9, shuffles / norms / residuals 1.1 |
+| prefill | 2.25 | 1.6 | attention 0.45, the rest 0.2 |
+| decode (fewer than 32 rows, memory-bound) | 4.1 | 0 | all of it |
+| layout | 2.3 | 0.6 | other operators ~0.9, cold start ~0.5, im2col and copies |
+
+About 10 of 20.6 s is GEMM tile; 9% of that is 0.9 s, which is what was measured. The largest
+untouched items are decode (20% of the page, 2.3-2.8 s from its streaming floor), attention (16%,
+at about 270 GFLOP/s of 860), and a floor no kernel moves: the five-token title block costs 2.0 s
+of vision because `min_pixels` hands the tower 672 patches however little it says.
+
 **Accuracy, which is the reason it is opt-in and not the reason to doubt it.** Per product, a
 sequential float32 chain has 2.3-2.5x the rounding error of the dot form against a float64
 reference (mean relative error 1.7e-6 against 7.5e-7 at a reduction of 1152, 3.7e-6 against 1.5e-6

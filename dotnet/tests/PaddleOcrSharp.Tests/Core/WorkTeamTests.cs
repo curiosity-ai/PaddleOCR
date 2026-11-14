@@ -128,4 +128,73 @@ public class WorkTeamTests
 
         Assert.All(seen, hits => Assert.Equal(1, hits));
     }
+
+    /// <summary>
+    /// <see cref="ParallelOptions.MaxDegreeOfParallelism"/> bounds how many items run at once, the
+    /// caller's thread included — measured, not assumed.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void MaxDegreeOfParallelismBoundsConcurrency(int degree)
+    {
+        using (Parallelism.Use(new ParallelOptions { MaxDegreeOfParallelism = degree }))
+        {
+            for (int round = 0; round < 20; round++)
+            {
+                int running = 0;
+                int peak = 0;
+                Parallelism.For(64, _ =>
+                {
+                    int now = Interlocked.Increment(ref running);
+                    int seen;
+                    while (now > (seen = Volatile.Read(ref peak)) && Interlocked.CompareExchange(ref peak, now, seen) != seen)
+                    {
+                    }
+
+                    Thread.SpinWait(2000);
+                    Interlocked.Decrement(ref running);
+                });
+
+                Assert.InRange(peak, 1, degree);
+            }
+        }
+    }
+
+    /// <summary>An unbounded degree (<c>-1</c>) still covers every index.</summary>
+    [Fact]
+    public void AnUnboundedDegreeStillCoversTheRange()
+    {
+        int[] seen = new int[200];
+        using (Parallelism.Use(new ParallelOptions { MaxDegreeOfParallelism = -1 }))
+        {
+            Parallelism.For(200, index => Interlocked.Increment(ref seen[index]));
+        }
+
+        Assert.All(seen, hits => Assert.Equal(1, hits));
+    }
+
+    /// <summary>A token cancelled while a region runs stops the items that have not started.</summary>
+    [Fact]
+    public void CancellingMidRegionStopsTheRemainingItems()
+    {
+        using var source = new CancellationTokenSource();
+        int started = 0;
+
+        using (Parallelism.Use(new ParallelOptions { CancellationToken = source.Token, MaxDegreeOfParallelism = 4 }))
+        {
+            Assert.ThrowsAny<OperationCanceledException>(() => Parallelism.For(100_000, _ =>
+            {
+                if (Interlocked.Increment(ref started) == 50)
+                {
+                    source.Cancel();
+                }
+
+                Thread.SpinWait(500);
+            }));
+        }
+
+        Assert.InRange(started, 50, 5000);
+    }
 }
