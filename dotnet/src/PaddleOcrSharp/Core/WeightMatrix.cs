@@ -192,7 +192,7 @@ public readonly struct WeightMatrix
         if (Dtype == DType.Int8)
         {
             Int8Weights.Dot4(
-                x, _bytes.Span, row, Cols, _scales.Span, GroupSize, row + 8 <= Rows ? 4 * Cols : 0,
+                x, _bytes.Span, row, Cols, _scales.Span, GroupSize, row + 16 <= Rows ? 8 * Cols : 0,
                 out a0, out a1, out a2, out a3);
             return;
         }
