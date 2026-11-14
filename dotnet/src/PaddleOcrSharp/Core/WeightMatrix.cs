@@ -17,13 +17,17 @@ public readonly struct WeightMatrix
 {
     private readonly ReadOnlyMemory<byte> _bytes;
 
-    private WeightMatrix(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols)
+    private WeightMatrix(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols, bool fromCheckpoint)
     {
+        FromCheckpoint = fromCheckpoint;
         _bytes = bytes;
         Dtype = dtype;
         Rows = rows;
         Cols = cols;
     }
+
+    /// <summary>Whether this is a model weight read from a checkpoint, as opposed to scratch posed as one.</summary>
+    internal bool FromCheckpoint { get; }
 
     /// <summary>Storage dtype.</summary>
     public DType Dtype { get; }
@@ -56,7 +60,7 @@ public readonly struct WeightMatrix
     }
 
     /// <summary>Wraps raw bytes as a weight matrix.</summary>
-    public static WeightMatrix Create(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols)
+    public static WeightMatrix Create(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols, bool fromCheckpoint = false)
     {
         long expected = (long)rows * cols * dtype.ByteSize();
         if (bytes.Length < expected)
@@ -72,7 +76,7 @@ public readonly struct WeightMatrix
                 $"{dtype} weights must be converted to float32 or bfloat16 before use.");
         }
 
-        return new WeightMatrix(bytes, dtype, rows, cols);
+        return new WeightMatrix(bytes, dtype, rows, cols, fromCheckpoint);
     }
 
     /// <summary>Wraps a float32 array as a weight matrix.</summary>

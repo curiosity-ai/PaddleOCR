@@ -70,6 +70,25 @@ public static class Gemm
             throw new ArgumentException("Bias buffer is too small.", nameof(bias));
         }
 
+        if (FakeQuant.ActivationBits != 0 && weight.FromCheckpoint)
+        {
+            using PooledBuffer quantised = FakeQuant.Activations(x.Span, rows, inner);
+            LinearCore(quantised.Memory, rows, inner, weight, bias, y, cols);
+            return;
+        }
+
+        LinearCore(x, rows, inner, weight, bias, y, cols);
+    }
+
+    private static void LinearCore(
+        ReadOnlyMemory<float> x,
+        int rows,
+        int inner,
+        WeightMatrix weight,
+        ReadOnlyMemory<float> bias,
+        Memory<float> y,
+        int cols)
+    {
         if ((long)rows * cols * inner < ParallelThreshold || Environment.ProcessorCount <= 1)
         {
             RunPanel(x.Span, rows, inner, weight, bias.Span, y.Span, cols, 0, cols);
@@ -152,6 +171,19 @@ public static class Gemm
             Linear(x, rows, inner, parts[0].Weight, parts[0].Bias, parts[0].Output, parts[0].Cols);
             return;
         }
+
+        if (FakeQuant.ActivationBits != 0 && parts[0].Weight.FromCheckpoint)
+        {
+            using PooledBuffer quantised = FakeQuant.Activations(x.Span, rows, inner);
+            LinearManyCore(quantised.Memory, rows, inner, parts, work);
+            return;
+        }
+
+        LinearManyCore(x, rows, inner, parts, work);
+    }
+
+    private static void LinearManyCore(ReadOnlyMemory<float> x, int rows, int inner, LinearPart[] parts, long work)
+    {
 
         if (work < ParallelThreshold || Environment.ProcessorCount <= 1)
         {

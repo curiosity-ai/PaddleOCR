@@ -23,11 +23,11 @@ public readonly record struct WeightTensor(string Name, DType Dtype, int[] Shape
             throw new InvalidOperationException($"'{Name}' has rank {Shape.Length}; expected a matrix.");
         }
 
-        return WeightMatrix.Create(Bytes, Dtype, Shape[0], Shape[1]);
+        return WeightMatrix.Create(Bytes, Dtype, Shape[0], Shape[1], fromCheckpoint: true);
     }
 
     /// <summary>Views the tensor as a <c>[rows, cols]</c> matrix with an explicit shape.</summary>
-    public WeightMatrix AsMatrix(int rows, int cols) => WeightMatrix.Create(Bytes, Dtype, rows, cols);
+    public WeightMatrix AsMatrix(int rows, int cols) => WeightMatrix.Create(Bytes, Dtype, rows, cols, fromCheckpoint: true);
 
     /// <summary>Widens the tensor into a newly allocated float32 array.</summary>
     public float[] ToFloats()
