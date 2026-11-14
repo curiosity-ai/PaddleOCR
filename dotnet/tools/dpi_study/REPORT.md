@@ -55,3 +55,52 @@ byte-identical at all fifteen resolutions, so every column below is the same for
 
 Vision-tower embeddings, dot against outer (relative L2 / worst per-token cosine): text block
 3.9e-6 / 0.999999998, table block 5.1e-5 / 0.9999992, title block 4.7e-6 / 1.000000000.
+
+## bf16 against `--quantization int8-compute`, all fifteen resolutions
+
+Both builds are the same binary; the int8 side runs from the published checkpoint
+(`paddleocr-vl/int8-compute/model.safetensors`, fetched by `paddleocr-sharp download --quantization
+int8-compute` into an empty cache and byte-identical to the file the quantiser wrote). One process
+per page, interleaved, the order alternating from one resolution to the next. `page` is the parser's
+own figure; stage columns are bf16 -> int8, seconds.
+
+| dpi | patches | page bf16 | page int8 | | vision | prefill | decode | layout |
+|---|---|---|---|---|---|---|---|---|
+| 20 | 531 | 19.7 | 9.5 | 2.08x | 5.8 -> 3.2 | 1.7 -> 0.7 | 7.8 -> 2.9 | 4.3 -> 2.6 |
+| 25 | 865 | 17.6 | 12.1 | 1.45x | 8.7 -> 5.1 | 1.7 -> 1.2 | 4.7 -> 3.3 | 2.3 -> 2.4 |
+| 30 | 842 | 18.6 | 12.9 | 1.44x | 9.1 -> 5.5 | 1.8 -> 1.1 | 5.0 -> 3.9 | 2.6 -> 2.3 |
+| 35 | 854 | 17.7 | 11.5 | 1.54x | 9.1 -> 5.1 | 1.7 -> 1.0 | 4.3 -> 2.7 | 2.6 -> 2.6 |
+| 40 | 858 | 17.4 | 11.6 | 1.50x | 8.9 -> 4.9 | 1.7 -> 1.0 | 4.0 -> 3.0 | 2.6 -> 2.4 |
+| 45 | 866 | 16.6 | 12.0 | 1.38x | 8.6 -> 5.2 | 1.7 -> 1.1 | 3.6 -> 3.0 | 2.5 -> 2.6 |
+| 50 | 866 | 17.1 | 11.9 | 1.44x | 8.8 -> 5.1 | 1.7 -> 1.1 | 4.1 -> 3.0 | 2.4 -> 2.6 |
+| 75 | 875 | 16.6 | 12.0 | 1.38x | 8.7 -> 5.5 | 1.7 -> 1.0 | 3.8 -> 2.9 | 2.3 -> 2.6 |
+| 100 | 903 | 18.0 | 11.8 | 1.52x | 9.4 -> 5.4 | 2.0 -> 1.1 | 4.0 -> 2.8 | 2.5 -> 2.5 |
+| 125 | 1045 | 19.9 | 13.8 | 1.44x | 11.3 -> 6.9 | 2.1 -> 1.4 | 4.0 -> 3.0 | 2.4 -> 2.5 |
+| 150 | 1193 | 22.2 | 15.5 | 1.43x | 13.0 -> 8.0 | 2.4 -> 1.6 | 4.3 -> 3.2 | 2.3 -> 2.6 |
+| 200 | 1803 | 37.0 | 25.7 | 1.44x | 25.1 -> 16.4 | 4.0 -> 2.6 | 5.3 -> 3.9 | 2.4 -> 2.7 |
+| 250 | 2675 | 59.6 | 46.5 | 1.28x | 44.7 -> 33.4 | 6.7 -> 5.7 | 5.4 -> 4.7 | 2.7 -> 2.6 |
+| 300 | 3121 | 68.9 | 52.1 | 1.32x | 51.7 -> 38.4 | 8.2 -> 5.6 | 6.2 -> 5.3 | 2.7 -> 2.7 |
+| 400 | 4451 | 107.2 | 82.7 | 1.30x | 86.6 -> 66.1 | 11.8 -> 9.1 | 6.0 -> 4.8 | 2.7 -> 2.5 |
+
+Whole process, all fifteen pages: **492.0 s -> 354.7 s (1.39x)**. The gain is 1.4-1.5x through
+the range the page is worth reading at (45-200 dpi) and falls to 1.3x above it, because attention
+grows quadratically in patches and stays float32 in both builds. Layout is untouched, as it should
+be; at 20 dpi the 2x is not a speed-up of the same work but a shorter decode of a garbled page.
+
+Quality, same scorer as above (`md5` is of the whole markdown):
+
+| dpi | text CER bf16 / int8 | word recall | table cells | markdown |
+|---|---|---|---|---|
+| 20 | 73.52% / 70.23% | 17.2 / 26.1 | 0 / 0 | differs |
+| 25 | 22.61% / 22.27% | 60.4 / 59.7 | 11 / 8 | differs |
+| 30 | 16.93% / 22.84% | 70.9 / 67.9 | 10 / 5 | differs |
+| 35 | 2.84% / 3.18% | 92.5 / 91.8 | 17 / 19 | differs |
+| 40 | 0.11% / 0.11% | 99.3 / 99.3 | 28 / 27 | differs (`53,784` -> `53,794`) |
+| 45 - 400 | 0.00% / 0.00% | 100 / 100 | 28 / 28 | **byte-identical** at all ten |
+
+Everything from 45 dpi up, which is every resolution at which bf16 reads the page perfectly, comes out
+byte-identical. Below it the two models are both wrong, in different places: at 35 dpi int8 reads
+`12,480` where bf16 wrote `12,490`, and bf16 wrote `driven` where int8 wrote `given`; at 30 dpi int8
+loses half the table cells bf16 kept. The one change that is not noise on an otherwise correct page is
+the 40-dpi digit, the same one the ten-page study found. Below 40 dpi neither build is usable, so the
+difference between them is a difference between two kinds of error.

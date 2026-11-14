@@ -1113,26 +1113,42 @@ give 138, taller tiles (6x4, 8x2) the same.
 
 ### Quantization: what int8 buys, what it costs, and the one flag
 
-Behind `--quantization none|int8|int8-compute` (`WeightQuantization` in the library; the environment
+Behind `--quantization none|int8-compute` (`WeightQuantization` in the library; the environment
 variable `PADDLEOCR_SHARP_QUANTIZATION` sets the default). Nothing is calibrated: plain
-round-to-nearest, symmetric, one scale per group of weights. Off by default; the default build's
-output is unchanged.
+round-to-nearest, symmetric, one scale per output row. Off by default; the default build's output is
+unchanged. `int8-compute` makes the vision tower, the projector and the decoder int8, and runs every
+product with 32 rows or more in integer arithmetic on quantised activations (see below).
 
-| | what is int8 | scales | speed | disk | peak RSS |
-| --- | --- | --- | --- | --- | --- |
-| `none` | nothing | | | 1828 MiB | 2790 MiB |
-| `int8` | decoder projections and `lm_head`, weights only | per 128 weights | decode -28%, page -3% | 1495 MiB | 2547 MiB |
-| `int8-compute` | those, and the tower and projector; **activations too** on products with 32+ rows | per row | **page -38%** | 1070 MiB | 2125 MiB |
+**There was a weight-only `int8` mode and it was removed.** It quantised the decoder and `lm_head` to
+int8 with a scale per 128 weights, which cut decode by 28% and a page by 3% (257 s against 266 s over
+the ten-page set), because the tower and prefill are bound by arithmetic and a narrower weight does
+nothing for them. Not worth a second checkpoint to publish and a second set of recognition results to
+explain next to the one that is worth it.
+
+| | what is int8 | speed | disk | peak RSS |
+| --- | --- | --- | --- | --- |
+| `none` | nothing | | 1828 MiB | 2790 MiB |
+| `int8-compute` | tower, projector, decoder; **activations too** on products with 32+ rows | **page -38%** | 1070 MiB | 2125 MiB |
+
+`--quantization int8-compute` also selects what `download` fetches and what a parse downloads when
+the cache is empty: `paddleocr-vl/int8-compute/model.safetensors` (1,121,856,264 bytes), with the
+tokenizer and configs taken from the original `paddleocr-vl/` directory, since only the weights differ
+(`ModelFile.RemotePath`, `ModelCatalog.PaddleOcrVL16Int8Compute`). The mirror answers a missing object
+with HTTP 200 and the text `Object Not Found`, so the downloader checks for that body rather than
+trusting the status. An explicit `--model-dir` is used as it is, bf16 or int8.
 
 Ten pages (a formula document, a table, a book page, an English document, a text line, two scene
 images, the synthetic A4 page at 100 and 40 dpi), one process, 266 s in bf16: **166 s** with
-`int8-compute` (vision 169.4 -> 97.3 s, prefill 32.3 -> 18.9 s, decode 43.5 -> 29.2 s) and 257 s with
-`int8` (decode 43.5 -> 31.4 s, vision and prefill unchanged). The 150 dpi synthetic page: 22.7 s ->
-16.5 s on load, 17.0 s from a stored checkpoint; loading with on-the-fly quantisation costs 1.5 s
-against 0.4 s, so the stored file is better in total.
+`int8-compute` (vision 169.4 -> 97.3 s, prefill 32.3 -> 18.9 s, decode 43.5 -> 29.2 s). The 150 dpi
+synthetic page: 22.7 s -> 16.5 s on load, 17.0 s from a stored checkpoint; loading with on-the-fly
+quantisation costs 1.5 s against 0.4 s, so the stored file is better in total. Over the fifteen
+resolutions of the synthetic A4 page, from the downloaded checkpoint, the whole run is 492.0 s ->
+354.7 s (1.39x), 1.4-1.5x for 45-200 dpi and 1.3x above, with **byte-identical markdown at every
+resolution from 45 dpi up** and differing text only where bf16 is itself already wrong
+(`tools/dpi_study/REPORT.md`).
 
 **Where each speed-up comes from.** Weight-only int8 halves the bytes a decode step streams, and
-decode is bound by exactly that, so it helps decode and nothing else: the tower and the prefill are
+decode is bound by exactly that, so it helps decode and nothing else (the mode that was removed): the tower and the prefill are
 bound by arithmetic, and a narrower weight widened into the same float32 panel is no faster (int8
 widened measured 313-467 GFLOP/s against bf16's 386-464 on the model's shapes). The page-level
 gain needed integer *compute*: a 256-bit `vpdpbusd` does thirty-two multiply-adds, and a
@@ -1154,9 +1170,9 @@ machine that has it.
 | --- | --- | --- | --- |
 | float32 control (summation order only) | 10/10 | 0 | exact |
 | vision tower int8 only (per row) | 10/10 | 0 | exact |
-| `int8`, decoder, per row | 8/10 | 9 | exact |
-| `int8`, decoder, per 128 (shipped) | 8/10 | 9 | exact |
-| everything int8, weights only | 7/10 | 11 | one table cell lost at 40 dpi |
+| decoder only, per row (experiment) | 8/10 | 9 | exact |
+| decoder only, per 128 (the removed `int8` mode) | 8/10 | 9 | exact |
+| everything int8, weights only (experiment) | 7/10 | 11 | one table cell lost at 40 dpi |
 | `int8-compute` (real kernel) | 5/10 | 44 | **a digit changed at 40 dpi** (`53,784` -> `53,794`); exact at 100 dpi |
 | plain int4, per 128 | 4/10 | 134 | plain text changed, a table cell lost |
 
@@ -1174,9 +1190,9 @@ against 44): the same arithmetic up to rounding, with long greedy decodes amplif
 difference, so the two are one distribution and neither is "the" result. Plain int4 is rejected as
 it stands; it would need calibrated rounding (GPTQ, AWQ), which is a different project.
 
-**Files.** `tools/quantization/quantize_checkpoint.py <out> --components dec --group 128` writes the
-`int8` checkpoint (1495 MiB); `--components all --group row` writes the `int8-compute` one (1070
-MiB). An int8 tensor is stored as `I8` with its scales beside it as `<name>.scale` (`F32`,
+**Files.** `tools/quantization/quantize_checkpoint.py <out>` writes the `int8-compute` checkpoint
+(1070 MiB; its defaults are `--components all --group row`), which is what the mirror holds;
+`--components dec --group 128` writes the weight-only experiment's. An int8 tensor is stored as `I8` with its scales beside it as `<name>.scale` (`F32`,
 `[rows, cols / group]`); the loader reads whatever the file holds, and `--quantization` decides
 only what an unquantised file is turned into on load and whether the integer path may run. The
 Python quantiser and the library's on-the-fly one are the same arithmetic in float32. The
