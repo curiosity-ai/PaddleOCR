@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- An independent check on `paddleocr-sharp bench`'s machine calibration, which reported 4.4x
+       the FMA rate this loop measures on the machine of the 100/150 dpi pass. Deliberately has no
+       reference to the library: nothing here can share a bug with the code it is checking. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <TieredCompilation>false</TieredCompilation>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IsAotCompatible>false</IsAotCompatible>
+  </PropertyGroup>
+
+</Project>

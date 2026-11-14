@@ -23,3 +23,18 @@ Single page, single run per DPI, greedy decoding (deterministic); wall time is w
 | 250 | 2067x2923 | 0.00% | 100.0% | 28/28 | 0.0% | 80.4 |
 | 300 | 2480x3508 | 0.00% | 100.0% | 28/28 | 0.0% | 91.4 |
 | 400 | 3307x4677 | 0.00% | 100.0% | 28/28 | 0.0% | 139.2 |
+
+## Throughput at 100 and 150 dpi
+
+Whole process, cold, base build against the optimised build, interleaved, three runs each
+(`page` is the parser's own figure; the other columns are the recognition profile's totals and the
+layout stage). The markdown is byte-identical (`md5 5cfc8ef5`) on all twelve runs.
+
+| dpi | build | page (s) | vision | prefill | decode | layout |
+|---|---|---|---|---|---|---|
+| 100 | before | 29.4 / 30.1 / 28.7 | 14.6-15.7 | 3.0-3.1 | 7.8-8.0 | 3.1 |
+| 100 | after | 18.2 / 18.5 / 17.7 | 9.1-9.3 | 1.8 | 4.0-4.7 | 2.5-2.7 |
+| 150 | before | 37.0 / 36.2 / 36.0 | 20.2-20.7 | 3.9-4.0 | 8.3-8.9 | 3.2-3.3 |
+| 150 | after | 23.5 / 23.3 / 23.0 | 13.2-13.5 | 2.4-2.5 | 4.5-4.8 | 2.6-2.7 |
+
+What changed and why is in `CLAUDE.md`, under "Alignment and the worker team".

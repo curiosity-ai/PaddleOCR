@@ -932,6 +932,94 @@ real A4-landscape page at about 70 dpi. What is left at 78 s is 45 s of vision o
 much less — 12.5 s of prefill, 15.6 s of decode for 1,737 tokens, and 3.5 s of layout. Getting
 under sixty would take a materially better GEMM, not another pass over this pipeline.
 
+### Alignment and the worker team: what a four-core page was spending that no kernel profile showed
+
+A synthetic A4 page (title, three paragraphs, a 7x4 table; `tools/dpi_study/`) parses to byte-identical
+markdown at every resolution from 40 to 400 dpi and falls apart below 35, so 100 and 150 dpi are the
+cheapest settings that still read it. Those two pages were profiled and tuned; what follows is the
+record. Machine: 4 cores, Xeon with AVX-512 (`avx512_fp16`, AMX present but unreachable from .NET).
+Whole process, cold, interleaved base against final, three runs each, best of three with the spread:
+
+| Page | before | after | | vision | prefill | decode | layout |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 dpi | 28.7 s (4.8%) | **17.7 s** (4.9%) | 1.62x | 14.6 -> 9.1 s | 3.0 -> 1.8 s | 7.8 -> 4.0 s | 3.1 -> 2.5 s |
+| 150 dpi | 36.0 s (2.8%) | **23.0 s** (2.3%) | 1.57x | 20.2 -> 13.2 s | 3.9 -> 2.4 s | 8.3 -> 4.5 s | 3.2 -> 2.6 s |
+
+The markdown is byte-identical on all twelve runs (`md5 5cfc8ef5` at both resolutions), so this is
+the same work in less time, and so are the GEMM outputs: every one of ten shapes hashes the same
+before and after. Allocation per page is unchanged (1.2-1.3 GiB, of which 1.0 GiB is the layout
+arena filling cold) and so is peak RSS (2.77 against 2.79 GiB). `--block-concurrency 2`,
+`--max-parallelism 2` and `1` all keep identical output and are faster too (29.3 -> 20.5, 44.6 -> 33.1,
+77.4 -> 59.5 s at 100 dpi).
+
+**The ceilings first, because the calibration in `bench` is not to be trusted on this machine.** Its
+FMA figure came out at 988 GFLOP/s for one thread (and 1397 after a "fix" that was reverted): about
+4.4x the 224 GFLOP/s an independent twelve-chain `a = a*m + c` loop sustains, which scales linearly to
+874 over four threads. The same loop as `bench` writes it ran at 47 GFLOP/s in a separate process and
+at roughly one iteration per cycle in the CLI — twelve FMAs per cycle, which no core does — so the
+loop's behaviour depends on how it is compiled, and no absolute figure from it was used here.
+Streaming read bandwidth, measured separately, is 45-49 GB/s over four threads and 15.8 over one.
+Against 224 and 874, the tower's GEMMs were at 28% of peak, and decode streamed weights at
+18.6 GB/s against 45. That is what said there was something to find.
+
+**1. 512-bit loads from a .NET array always straddle two cache lines.** An array's elements start
+sixteen bytes past its header, so no pooled buffer was 64-byte aligned, and every `vmovups zmm` from
+one touched two lines. The four-by-four GEMM tile issues eight loads per sixteen FMAs, and split
+loads doubled that to sixteen per eight cycles — both load ports. It was found by cloning the
+library's panel structure in a harness and removing pieces one at a time until the one that moved the
+number was the buffer's address: the same loop over `NativeMemory.AlignedAlloc` buffers ran 483
+GFLOP/s at four threads against 331, aligned weight panel alone 450. `TensorPool.Rent` and
+`Tensor.Rent` now start their usable region on a cache line (`AlignmentOffset`), which fixes the
+activations, the attention buffers and the GEMM's widened panel at once; the convolution's im2col
+columns, rented as bytes, got the same. Alignment moves data and changes no arithmetic, so it is
+bit-identical by construction; `AlignmentTests` pins both the alignment and that a GEMM gives the
+same bits either way. Tower, 1368 patches: 6.20 -> 4.74 s; conv GEMM 312 -> 421-468 GFLOP/s; warm
+layout detection 2.5-2.76 -> 1.79-2.0 s. The address is read without pinning, so a gen0 array that a
+collection relocates can end up misaligned — a speed loss and never a wrong answer, and the arrays
+where it matters are in the large-object heap, which does not move; the test asserts alignment only
+there.
+
+**2. The same tile on raw pointers is 1.7x the span-indexed one.** `Dot4x4` indexed spans, so each of
+its eight loads per step carried a bounds check and its own address arithmetic: 80 GFLOP/s a thread
+against 135-142 for the identical tile on pointers (one thread, panel in L2). `Tile4x4Wide` is that
+tile, with the same per-lane accumulation order and the same final reduction, writing straight into
+`y` instead of through a scratch tile; the span version stays for 256-bit machines and for lengths
+that are not a multiple of sixteen. In the full four-thread GEMM it was worth only 8% until the
+alignment above, which is the order those two findings came in and why the second looked like a
+small win for a while.
+
+**3. `Parallel.For` parks its workers, and waking them costs more than a decode step's regions last.**
+The decode step is a hundred and thirty parallel regions of 20-400 us, and a streaming read split
+into per-matrix regions ran 29 GB/s against 57 with no region boundary. Per-thread busy time inside
+one 12 MB region came out 388 / 395 / 186 / 117 us: two of four workers joined after the other two
+had finished most of it, which is one and a half threads of work on four cores. Dispatch itself is
+5 us hot, so the cost was never the fork-join; it was the wake-up of a thread that had parked during
+the previous region. `WorkTeam` is the answer: three helpers that spin for 300 us after their last
+region before they park, dynamic claiming (in blocks when there are many items), the caller as the
+fourth worker, `Parallelism.For` as the one entry point, and `Parallel.For` as the fallback whenever
+the team is in use — a region nested in a region, or a second block's tower under
+`--block-concurrency`. Cancellation and exceptions surface as `Parallel.For` surfaces them, and the
+helpers adopt the caller's `Parallelism` scope while they work (`WorkTeamTests`). Single-row GEMM at
+DRAM speed went 456-496 -> 267-343 us (up to 47 GB/s, the ceiling), four rows 759-808 -> 402-422;
+decode -45%, and the tower, whose regions are milliseconds, still gained 11% (4.54-4.74 -> 4.06 s on
+1368 patches), though which of its stages that came from was not separated. Two details that cost a measurement each: the caller's wait for stragglers must not be
+`SpinWait.SpinOnce`, which escalates to `Thread.Sleep(1)` — the first version of the team made
+multi-row calls *slower* for exactly that reason — and publishing a region and parking a helper both
+need a full fence, because each reads what the other just wrote and a store followed by a load may
+reorder.
+
+**4. What the attention kernels needed was smaller than it looked.** Padding the transposed keys and
+score rows to a multiple of sixteen floats, and the per-head value and output rows to 80 (five cache
+lines where 72 floats is four and a half), took the score kernel 5-10% and the value kernel nothing,
+bit-identically. Attention is 21% of the tower, so that is 1-2% of it; it stays because it is free.
+
+What is left, at 150 dpi: the tower's GEMMs are at 410-420 GFLOP/s (48% of peak, 86% of what the
+bare tile does on four threads), decode is at 20 ms a step against a 14 ms streaming floor, and a
+cold layout detection is 0.7 s slower than a warm one (JIT with tiering off, and 811 MiB of arena
+buffers faulted in). The dot-form tile is capped at 137 GFLOP/s a thread by something a counter-less
+VM cannot name: removing its sixteen lane reductions gives 155, a 64-bit loop index and a 2x unroll
+give 138, taller tiles (6x4, 8x2) the same.
+
 ### Things that looked like wins and were not
 
 Each of these is a plausible optimisation that the benchmark rejected. They are recorded because
@@ -1032,6 +1120,28 @@ comment, and the two cold-start answers that did not work — and the generalise
   GEMM variant measured slower than the 256-bit kernel, including a narrowed tile chosen to fit
   the register file. See `Core/Simd.cs`; the override is left to whoever measures their own
   machine.
+- **An outer-product GEMM tile (lanes are output columns, no lane reductions).** On a packed
+  `[k][32]` panel, eight rows by thirty-two columns held in sixteen `zmm`, it measured 172-177
+  GFLOP/s a thread against 137 for the dot-form tile: +27% on the kernel, which would be about 10% of
+  a page. Not taken, because each output then accumulates in one sequential chain instead of sixteen
+  lane chains and a final reduction, so the floats differ from every earlier build's and the
+  byte-identity bar is gone for a gain that is real but modest. It is the next thing to try if that
+  bar is ever relaxed deliberately; the prototype is a page of code.
+- **Taller tiles, a 64-bit loop index and a 2x unroll for the dot-form tile.** 6x4 and 8x2 measured
+  136-137 against 136-142 for 4x4 (same accumulation order, so they would have been bit-identical);
+  a `nint` index with the loop unrolled twice measured 138. The tile is not loop-overhead-bound.
+- **Taller score tiles in attention** (6x2, 8x2, 4x3 against 4x2): +10, +14 and +20% in isolation,
+  which on a kernel that is 8% of the tower is about 1% of it. Not worth the code.
+- **GC settings for the cold layout detection.** Workstation against server GC, concurrent on and
+  off, over three interleaved rounds: first detection 2.3-2.9 s in every configuration, no
+  separation. The 0.7 s it costs over a warm one is JIT and first-touch page faults, not collection.
+- **Aligning the convolution's filters as well as its columns.** Measured +12% on the conv GEMM
+  against +35% for the columns, but it needs either a per-call copy of the filters (125 MB over a
+  detection, which eats most of the gain) or a second persistent copy. Columns only.
+- **A skinny multi-row decode kernel (widen on the fly, no panel).** Estimated before building it:
+  with the worker team in, a four-row step costs about 1.5x a one-row step, and the best this could
+  do is bring that to about 1.2x, which over a page's 66 batched steps is about 0.2-0.4 s of 23.
+  Not built.
 
 ### Traps that make a SIMD microbenchmark lie
 
@@ -1040,7 +1150,10 @@ indexed accumulator that is never enregistered — each report roughly a fifth o
 looking entirely reasonable, and all three were hit while building the calibration above. They
 generalise past this port, so they live in
 [`measuring-performance`](.claude/skills/measuring-performance/SKILL.md) §6 with the rest of the
-method. Read that before writing a microbenchmark; `MachineProfile.cs` is the worked example.
+method. Read that before writing a microbenchmark; `MachineProfile.cs` is the worked example of the
+traps, and also of a fourth: its absolute figures were found wrong by 4.4x on the machine of the
+latest pass (see "Alignment and the worker team"), so cross-check a ceiling against an independent
+loop before dividing anything by it.
 
 ## What the pipeline does beyond the models
 
