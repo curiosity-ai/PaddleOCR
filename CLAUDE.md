@@ -1073,6 +1073,37 @@ resolution, and decode still runs the dot form (it has fewer than 32 rows); the 
 would move this from opt-in to default, and `GemmOuterTests` pins the accuracy per product against a
 float64 reference in the meantime.
 
+**6. Projections that share an input are computed together, and nothing else about the weights is
+worth doing ahead of time.** `Gemm.LinearMany` takes a layer's query, key and value (and the decoder's
+gate and up) as one call: the activations are packed once instead of three times, and all the
+projections' column panels run in one parallel region, so a decode step has four region boundaries a
+layer where it had seven. It reads the weights where they lie rather than concatenating them, which
+would have copied 215 MB out of the memory-mapped checkpoint. Each output is bit-identical to a
+call of its own in both accumulation orders (`GemmManyTests`). Interleaved on a page, best of three,
+before -> after: vision 12.8 -> 11.9 s and prefill 2.31 -> 2.13 s with the outer tile on, 13.3 ->
+12.9 and 2.50 -> 2.32 without; markdown byte-identical in all four configurations. A single-row
+decode step went 18.2 -> 16.4 ms at best of three, but the other two rounds were flat (19.6 against
+18.8, 20.9 against 21.2), so a decode gain is not established.
+
+What else was checked as work to do once, at load, instead of per call:
+
+| Candidate | Measured | Verdict |
+| --- | --- | --- |
+| Align the weights in memory | 77% of the checkpoint's bytes sit at 32 mod 64, the rest at 0. Cold single-row decode streams at 44.8-46.4 GB/s from offset 0 and 45.1-47.4 from offset 32; five rows 20.6-22.9 against 20.3-23.6 | No effect. The weight loaders use 32-byte loads, which cannot straddle a line at 32-byte alignment; the 512-bit loads that did are on activations and panels |
+| Widen bf16 to float32 once | Widening is 7.7 Gelem/s a thread: about 11 ms a tower pass, 0.25% of it | Nothing to save in the tower; float32 weights would double the bytes a decode step streams, which is what bounds it |
+| Pre-fault the memory-mapped weights | A first tower pass costs 0-1.25 s more than the fourth (0.1 s in two of three runs); a page takes 325k minor faults for 0.8-0.9 s of system time spread over four cores | At most a couple of tenths of a second, and moving the faults would not remove them |
+| Concatenate q/k/v and gate/up | `LinearMany` gets the same sharing without the copy | Not needed |
+| Fold the norm scale and shift, or the attention scale, into the next weights | Would re-round bf16 weights | Not bit-identical and not a float32 rounding difference but a change to the model; rejected |
+| Fold batch norm into the layout convolutions | `batch_norm_` is 25 ms of a 1.8 s detection | 1.4%, and not bit-identical |
+| Keep an aligned copy of the convolution filters | +12% of the conv GEMM (about 0.07 s), 125 MB resident | Possible, small |
+
+The one place the weights are re-processed on every call and it shows is the batched decode step: a
+five-row step streams at about 21 GB/s where a one-row step streams at 45, because rows 4 and up
+widen each panel into a float32 scratch before using it. That cannot be precomputed away (see the
+float32 row above); it is the case for the skinny widen-on-the-fly kernel, and the measured gap is
+larger than the earlier estimate under "Things that looked like wins": 66 batched steps a page at
+16 ms each is about 0.8 s, 4% of it.
+
 What is left, at 150 dpi: the tower's GEMMs are at 410-420 GFLOP/s (48% of peak, 86% of what the
 bare tile does on four threads), decode is at 20 ms a step against a 14 ms streaming floor, and a
 cold layout detection is 0.7 s slower than a warm one (JIT with tiering off, and 811 MiB of arena
@@ -1198,7 +1229,8 @@ comment, and the two cold-start answers that did not work — and the generalise
 - **A skinny multi-row decode kernel (widen on the fly, no panel).** Estimated before building it:
   with the worker team in, a four-row step costs about 1.5x a one-row step, and the best this could
   do is bring that to about 1.2x, which over a page's 66 batched steps is about 0.2-0.4 s of 23.
-  Not built.
+  Not built — **and the estimate was low**: a cold-DRAM measurement later put five rows at 21 GB/s
+  against 45 for one, which is about 0.8 s a page (item 6 above). It is the next thing to build.
 
 ### Traps that make a SIMD microbenchmark lie
 
