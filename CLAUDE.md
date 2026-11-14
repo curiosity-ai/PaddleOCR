@@ -1240,6 +1240,22 @@ a call (-22.9%, median -24.6%), 2500 tokens -15.4% (median -8.1%), 1200 tokens -
 -6.8%, inside the noise)**, with the scores kernel's thread time 981 -> 582 ms and the values
 kernel's 1070 -> 852 ms at 4900. Softmax and the transpose are flat, as controls.
 
+End to end, the old and the new CLI built from the commits either side of the change, one process per
+page, interleaved (the synthetic A4 page, `--quantization int8-compute`, 4 cores). **The markdown is
+byte-identical on all twelve runs** (`md5 5cfc8ef5`).
+
+| Page | patches | old | new | vision old -> new |
+| --- | --- | --- | --- | --- |
+| 150 dpi | 1193 | 21.1 / 19.9 / 20.1 s | 20.4 / 20.6 / 21.1 s | 11.4 / 10.7 / 10.8 -> 10.9 / 11.0 / 11.5 s |
+| 400 dpi | 4451 | 109.9 / 106.8 s | 96.7 / 95.8 s (**-11%**) | 87.1 / 83.8 -> 73.7 / 74.4 s (**-13%**) |
+| 300 dpi, bf16 (one pair) | 3121 | 90.4 s | 88.2 s | 68.9 -> 65.9 s |
+
+The gain is the large-block gain and nothing else: a page whose blocks are around a thousand patches
+does not move (the 150 dpi rows are inside each other's spread), and the 400 dpi page is the one
+block of 4451 patches the isolated measurement above was built to look at. The 13% of vision is
+what the harness's 23% of attention predicts once attention is 70% of the tower and the
+transpose is counted; the single bf16 pair is a hint, not a result.
+
 - **The query block is the effect.** Every block streams the whole of a head's keys and values, so
   the rows per block divide that traffic; 128 rows is 2.5 MB of scores at the largest page we
   accept and still inside L2, and past it nothing more is gained. The block of 16 was chosen at a
