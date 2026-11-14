@@ -66,6 +66,10 @@ public class GemmInt8Tests
     [InlineData(100, 1024, 13, true)]
     [InlineData(70, 4304, 21, false)]
     [InlineData(37, 4608, 130, true)]
+    [InlineData(34, 80, 9, false)]
+    [InlineData(34, 96, 9, true)]
+    [InlineData(34, 112, 9, false)]
+    [InlineData(40, 16, 130, true)]
     public void MatchesTheQuantisedReference(int rows, int inner, int cols, bool useBias)
     {
         if (!GemmInt8.Available)
@@ -85,6 +89,85 @@ public class GemmInt8Tests
         {
             double tolerance = 1e-5 + (Math.Abs(expected[i]) * 2e-6);
             Assert.True(Math.Abs(expected[i] - actual[i]) <= tolerance, $"[{i}] expected {expected[i]} got {actual[i]}");
+        }
+    }
+
+    /// <summary>
+    /// The tiles' integer sums are exact: equal to a scalar sum at every remainder a 32-byte step can
+    /// leave (0 and 16 bytes) and at the model's own reduction lengths (1152, 1024, 3072, 4304 with a
+    /// remainder of 16, 4608), for random bytes and for the extremes, where a sum is largest.
+    /// </summary>
+    [Theory]
+    [InlineData(16)]
+    [InlineData(32)]
+    [InlineData(48)]
+    [InlineData(64)]
+    [InlineData(80)]
+    [InlineData(96)]
+    [InlineData(112)]
+    [InlineData(128)]
+    [InlineData(1024)]
+    [InlineData(1152)]
+    [InlineData(3072)]
+    [InlineData(4304)]
+    [InlineData(4608)]
+    public unsafe void TilesGiveTheExactIntegerSums(int k)
+    {
+        if (!GemmInt8.Available)
+        {
+            return;
+        }
+
+        var random = new Random(k);
+        byte[] x = new byte[4 * k];
+        sbyte[] w = new sbyte[4 * k];
+        random.NextBytes(x);
+        for (int i = 0; i < w.Length; i++)
+        {
+            w[i] = (sbyte)random.Next(-127, 128);
+        }
+
+        // The extremes, where a sum is largest: every activation 255, every weight -127.
+        byte[] xMax = Enumerable.Repeat((byte)255, 4 * k).ToArray();
+        sbyte[] wMin = Enumerable.Repeat((sbyte)-127, 4 * k).ToArray();
+
+        foreach ((byte[] xs, sbyte[] ws) in new[] { (x, w), (xMax, wMin) })
+        {
+            int[] expected = new int[16];
+            for (int i = 0; i < 4; i++)
+            {
+                for (int j = 0; j < 4; j++)
+                {
+                    for (int d = 0; d < k; d++)
+                    {
+                        expected[(i * 4) + j] += xs[(i * k) + d] * ws[(j * k) + d];
+                    }
+                }
+            }
+
+            int[] actual = new int[16];
+            fixed (byte* px = xs)
+            fixed (sbyte* pw = ws)
+            fixed (int* pa = actual)
+            {
+                GemmInt8.Tile4x4(px, k, pw, k, pa);
+            }
+
+            Assert.Equal(expected, actual);
+
+            // Four rows against one weight row, the ragged-panel tile.
+            for (int j = 0; j < 4; j++)
+            {
+                int[] one = new int[4];
+                fixed (byte* px = xs)
+                fixed (sbyte* pw = ws)
+                fixed (int* po = one)
+                {
+                    GemmInt8.Tile4x1(px, k, pw + (j * k), po);
+                }
+
+                Assert.Equal(Enumerable.Range(0, 4).Select(i => expected[(i * 4) + j]).ToArray(), one);
+            }
         }
     }
 

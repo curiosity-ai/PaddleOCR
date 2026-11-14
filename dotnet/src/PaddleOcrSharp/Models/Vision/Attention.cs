@@ -45,9 +45,12 @@ public static class Attention
         int rowStride,
         StageProfile? profile = null)
     {
-        // Wide enough that a block amortises the key and value traffic, narrow enough that the
-        // scores stay well inside L2 (16 x 5120 floats is 320 KB at the largest page we accept).
-        const int Block = 16;
+        // Wide enough that a block amortises the key and value traffic — every block streams the
+        // whole of a head's keys and values, so the rows per block divide that traffic — and narrow
+        // enough that the scores stay inside L2: 128 x 5120 floats is 2.5 MB at the largest page
+        // we accept. Measured from 8 to 512 rows at 4900 patches: 8 is 17% slower than 16, and
+        // everything from 128 up is within noise of each other at about 23% faster.
+        const int Block = 128;
 
         long transposeTicks = 0, scoreTicks = 0, softmaxTicks = 0, valueTicks = 0;
 
@@ -72,9 +75,9 @@ public static class Attention
             // One transpose of this head's keys serves every row-block below, of which there are
             // `tokens / Block`. See AttentionKernels for why the score product wants them this
             // way round.
-            using PooledBuffer keysT = TensorPool.Rent(headDim * keyStride);
+            using PooledBuffer keysT = TensorPool.Rent(AttentionKernels.KeyBufferLength(tokens, headDim));
             long mark = Stopwatch.GetTimestamp();
-            AttentionKernels.TransposeHead(k.Span, tokens, headDim, keysT.Span, keyStride);
+            AttentionKernels.TransposeHead(k.Span, tokens, headDim, keysT.Span);
             long transpose = Stopwatch.GetTimestamp() - mark;
             long score = 0, soft = 0, value = 0;
 
@@ -90,7 +93,6 @@ public static class Attention
                     headDim,
                     keysT.Span,
                     tokens,
-                    keyStride,
                     block.Span,
                     keyStride);
                 score += Stopwatch.GetTimestamp() - mark;

@@ -16,7 +16,7 @@
     <PackageId>PaddleOCR.Cli</PackageId>
     <Title>PaddleOCR for .NET — command-line tool</Title>
     <Description>`paddleocr-sharp`, the command-line front-end to the PaddleOCR .NET library: parse pages of a PDF or an image to markdown and JSON, recognise a single cropped block, fetch the models, and benchmark the stages. Pure C#, no ONNX Runtime and no Paddle Inference.</Description>
-    <!-- A tool runs on whatever runtime the machine has, which will not be exactly 10.0.x. -->
+    <!-- A tool runs on whatever runtime the machine has, which will not be exactly 11.0.x. -->
     <RollForward>Major</RollForward>
   </PropertyGroup>
 
@@ -40,7 +40,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="11.0.0" />
   </ItemGroup>
 
   <!-- SkiaSharp and PDFium between them ship natives for two dozen runtime identifiers, and a

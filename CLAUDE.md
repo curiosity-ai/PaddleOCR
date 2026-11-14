@@ -107,7 +107,7 @@ from another tensor's shape at run time arrives), or a scale; UVDoc uses the lis
 ```
 dotnet/
   PaddleOcrSharp.slnx
-  Directory.Build.props        # net10.0, unsafe, nullable, preview lang, package metadata
+  Directory.Build.props        # net11.0, unsafe, nullable, preview lang, package metadata
   Directory.Build.targets      # attaches the repository README to the packable projects
   src/
     PaddleOcrSharp/            # the library — everything below is here
@@ -149,7 +149,7 @@ SkiaSharp's resampler matches neither and is used only for decoding and encoding
 
 ## Engineering conventions
 
-- **.NET 10 / C# preview.** Use `System.Numerics.Tensors`, `Vector<T>` / `Vector512<T>`,
+- **.NET 11 / C# preview.** Use `System.Numerics.Tensors`, `Vector<T>` / `Vector512<T>`,
   `TensorPrimitives`, `ArrayPool<T>` and `MemoryPool<T>`. Hot loops must be allocation-free —
   and "allocation-free" includes the compiler's own: a method that contains a lambda *anywhere*
   allocates its display class on entry, whichever branch runs, so a hot method with a parallel
@@ -1160,9 +1160,9 @@ contiguous reduction vector the tile wants — so nothing is widened or repacked
 quantised once per call (once for q, k and v together), shifted to unsigned for the instruction,
 and the shift is undone with each weight row's sum, computed once per matrix. The scale must be one
 per row: a grouped scale needs a conversion and a multiply-add every 128 weights, about half the
-gain. AMX and AVX-512 VNNI are not exposed by .NET 10 here (`AvxVnni`, the 256-bit form, is), so this
+gain. AMX is not exposed by .NET, and the 512-bit form of the instruction was not exposed by .NET 10 (`AvxVnni`, the 256-bit form, was), so this
 runs at 256 bits; without `AvxVnni` it is weights-only and its output can differ slightly from a
-machine that has it.
+machine that has it. **.NET 11 does expose the 512-bit form** — see "What .NET 11 adds" below.
 
 **What it costs in recognition**, against the bf16 output of the same ten pages:
 
@@ -1200,6 +1200,109 @@ experiment tooling that produced the table is in the same directory: `make_varia
 quantise-then-dequantise float32 checkpoint of any scheme), `score_variants.py`, and the
 `PADDLEOCR_SHARP_FAKE_A_BITS` hook, which emulates per-token integer activations without a kernel.
 
+### What .NET 11 adds, and the one thing in it that matters here
+
+The port moved to .NET 11 (see the project layout). Enumerating every `System.Runtime.Intrinsics.X86`
+type in both runtimes on this machine (a Xeon with `avx512_vnni`, `avx512_bf16`, `avx512_fp16` and
+AMX in `/proc/cpuinfo`) shows **one new class and one new nested class**:
+
+| New in .NET 11 | Supported here | Use |
+| --- | --- | --- |
+| `AvxVnni.V512` — `vpdpbusd` / `vpdpwssd` on `Vector512` | **yes** | the int8 GEMM tile, at twice its width |
+| `Avx512Bmm` — bit matrix multiply | no | none |
+| `System.Numerics.BFloat16` | n/a | scalar conversions only; no vector operations |
+
+Still not exposed, though the CPU has them: **AMX** (no type in either runtime), **AVX-512 BF16**
+(`vdpbf16ps`) and **AVX-512 FP16** (reachable only through `Avx10v1`, which this CPU lacks).
+`AvxVnniInt8` / `AvxVnniInt16` exist in both and are unsupported here; they would remove the
+unsigned shift the int8 path applies to its activations, on a CPU that has them.
+
+`tools/vnni` measures what the 512-bit instruction is worth, against the 256-bit one the kernels use
+(five rounds, best of three each; rates count int8 multiply-adds):
+
+| | 256-bit | 512-bit | |
+| --- | --- | --- | --- |
+| pure throughput, twelve chains | 190-215 GMAC/s | 312-367 GMAC/s | 1.6-1.9x |
+| a 4x4 tile like `GemmInt8`'s, in L1 | 177-184 GMAC/s | 249-255 GMAC/s | **1.39-1.56x** |
+
+The isolated tile said 1.4x, and **the kernel it was meant for did not get faster**: it was built
+(commits `7d0e46b` and the one after it) and is not in the tree. See the entry under "Things that
+looked like wins and were not". What survives is the finding that the tower's int8 products are not
+bound by the instruction at all.
+
+### Attention at large blocks: what a 4900-patch block was spending
+
+With the tower's matrix products in int8, attention is what is left of it. Profiled under
+`--quantization int8-compute` at the 4900-patch block a scanned page produces, attention was **18.9 s
+of a 26.8 s tower (70%)**, the MLP, qkv and output products 21%. Inside attention the thread time
+split 44% scores, 46% values, 11% softmax. That is also why the int8 speed-up fell from 1.5x at
+100 dpi to 1.3x at 400: attention stays float32 and grows with the square of the patch count.
+
+The rate said where to look. 4·n²·72 FLOP a head a layer is 2,990 GFLOP for the tower at 4900
+patches, so 18.9 s is **158 GFLOP/s, against about 270 at 150 dpi** with the same kernels. A rate
+that falls as the problem grows is a cache or bandwidth effect, and the arithmetic of it fits: each
+thread owns a head, so its working set is 1.4 MB of keys, 1.6 MB of values and 0.3 MB of scores,
+more than a 2 MB L2; and every block of 16 query rows streams all of it once for 22.6 MFLOP, about
+7.5 FLOP per byte, which at 158 GFLOP/s is 20 GB/s, the L3 figure measured elsewhere in this file.
+The earlier "row-block sizing" and "taller tiles" entries below were rejected when the kernels were
+half as fast and the stage a fifth of the tower; both conclusions were true then and are not now.
+
+Measured in `bench`-sized isolation (`Attention.Bidirectional`, 16 heads x 4900 tokens x 72, one
+process per configuration, interleaved, the baseline at both ends of every round, best of five
+calls a process, eight rounds). **The host's spread here was 15-35% of the best from round to round,
+so only the large effects below are established; the small ones are not.** All of these are
+bit-identical to the old kernels (checked by hashing the whole output at 1, 37, 129, 1100, 1200,
+2500 and 4900 tokens) except the chunk size.
+
+| Change | 4900 tokens, best / median vs baseline |
+| --- | --- |
+| 8 query rows a block | +17% / +20% (slower) |
+| 32 | -3% / -9% |
+| 64 | -15..-21% / -12..-14% |
+| 128, 256, 512 | -23% / -23..-25% (indistinguishable from each other) |
+| 64 + tile-major keys | -20% / -16% |
+| 64 + 4x3 score tile | -18% / -14% |
+| 64 + tile-major keys + 4x3 tile | -26% / -22% |
+| **128 + tile-major keys + 4x3 tile (shipped)** | **-23% / -25%** (-32% / -25% in an earlier round) |
+
+Frozen into the code and run against the old build, interleaved, 8 rounds: **4900 tokens 603 -> 465 ms
+a call (-22.9%, median -24.6%), 2500 tokens -15.4% (median -8.1%), 1200 tokens -8.9% (median
+-6.8%, inside the noise)**, with the scores kernel's thread time 981 -> 582 ms and the values
+kernel's 1070 -> 852 ms at 4900. Softmax and the transpose are flat, as controls.
+
+End to end, the old and the new CLI built from the commits either side of the change, one process per
+page, interleaved (the synthetic A4 page, `--quantization int8-compute`, 4 cores). **The markdown is
+byte-identical on all twelve runs** (`md5 5cfc8ef5`).
+
+| Page | patches | old | new | vision old -> new |
+| --- | --- | --- | --- | --- |
+| 150 dpi | 1193 | 21.1 / 19.9 / 20.1 s | 20.4 / 20.6 / 21.1 s | 11.4 / 10.7 / 10.8 -> 10.9 / 11.0 / 11.5 s |
+| 400 dpi | 4451 | 109.9 / 106.8 s | 96.7 / 95.8 s (**-11%**) | 87.1 / 83.8 -> 73.7 / 74.4 s (**-13%**) |
+| 300 dpi, bf16 (one pair) | 3121 | 90.4 s | 88.2 s | 68.9 -> 65.9 s |
+
+The gain is the large-block gain and nothing else: a page whose blocks are around a thousand patches
+does not move (the 150 dpi rows are inside each other's spread), and the 400 dpi page is the one
+block of 4451 patches the isolated measurement above was built to look at. The 13% of vision is
+what the harness's 23% of attention predicts once attention is 70% of the tower and the
+transpose is counted; the single bf16 pair is a hint, not a result.
+
+- **The query block is the effect.** Every block streams the whole of a head's keys and values, so
+  the rows per block divide that traffic; 128 rows is 2.5 MB of scores at the largest page we
+  accept and still inside L2, and past it nothing more is gained. The block of 16 was chosen at a
+  size where this did not bind.
+- **Tile-major keys.** The transposed keys are stored `[tile][headDim][128]` instead of
+  `[headDim][tokens]`, so one score tile is a single 37 KB sequential read instead of 72 strided
+  ones a whole key row (20 KB) apart: more streams than the prefetcher follows and more pages than
+  the L1 TLB holds. Alone it is within the noise; with the 4x3 tile the scores kernel is 22%
+  faster than with the block change alone (803 -> 629 thread-ms), and the pair is kept.
+- **A 4x3 score tile** (four query rows by three 512-bit vectors, twelve accumulators, 48 keys a
+  step) against 4x2. The leftover columns of a tile go to the 4x2 kernel, and a machine without
+  512-bit vectors never takes it. Every output still accumulates over the head's 72 dimensions in
+  the same order, so it is bit-identical.
+- **`AttentionTests`** pins `Attention.Bidirectional` against a double-precision reference at
+  1, 3, 37, 128, 129, 300, 1000 and 1030 tokens, under the 512-bit path and with
+  `PADDLEOCR_SHARP_VECTOR_BITS=256`; there was no direct test of attention before this.
+
 ### Things that looked like wins and were not
 
 Each of these is a plausible optimisation that the benchmark rejected. They are recorded because
@@ -1220,6 +1323,8 @@ comment, and the two cold-start answers that did not work — and the generalise
 - **Sizing attention's row-block from the token count**, so a page's keys and values are read
   half as many times. No measurable change, which is what rules key and value bandwidth out as
   attention's limit.
+  **Superseded**: re-measured at 4900 patches after the kernels had doubled in speed, the rows per
+  block *is* the effect — 128 against 16 is 23% faster. See "Attention at large blocks".
 - **Giving attention's score product the four-by-four tile `Gemm.Linear` uses.** The argument is
   that `Dot4` issues five loads per four multiply-adds where `Dot4x4` issues eight per sixteen, so
   the wider tile should be load-bound where the narrow one is not. Exactly neutral, and the reason
@@ -1309,6 +1414,9 @@ comment, and the two cold-start answers that did not work — and the generalise
   a `nint` index with the loop unrolled twice measured 138. The tile is not loop-overhead-bound.
 - **Taller score tiles in attention** (6x2, 8x2, 4x3 against 4x2): +10, +14 and +20% in isolation,
   which on a kernel that is 8% of the tower is about 1% of it. Not worth the code.
+  **Partly superseded**: scores are about 30% of the tower's thread time at a 4900-patch block, not
+  8%, and 4x3 is kept (with tile-major keys and 128-row blocks); 8x2 and 6x2 were re-measured and
+  stay rejected — see below.
 - **GC settings for the cold layout detection.** Workstation against server GC, concurrent on and
   off, over three interleaved rounds: first detection 2.3-2.9 s in every configuration, no
   separation. The 0.7 s it costs over a warm one is JIT and first-touch page faults, not collection.
@@ -1323,6 +1431,55 @@ comment, and the two cold-start answers that did not work — and the generalise
   do is bring that to about 1.2x, which over a page's 66 batched steps is about 0.2-0.4 s of 23.
   Not built — **and the estimate was low**: a cold-DRAM measurement later put five rows at 21 GB/s
   against 45 for one, which is about 0.8 s a page (item 6 above). It is the next thing to build.
+
+- **8x2 and 6x2 score tiles, again, at 4900 patches.** Against 4x3, in the same interleaved sitting:
+  8x2 +2.4% / +1.0%, 6x2 +0.4% / -4.6% (best / median) of the baseline, where 4x3 was -3.7% / -9.9%
+  and 4x3 with tile-major keys and 64-row blocks -26% / -22%, 6x2 in that combination -24% / -19%.
+  More accumulators per load is not what limits this kernel; 4x3 covers three vectors of keys a step
+  and is the one kept.
+- **Taking each row's maximum per tile, while the tile is in L1.** The softmax pass's first read of
+  the row is what it removes: softmax thread time fell 257 -> 202 ms (-21%) and the scores kernel
+  rose by about the same, 894 -> 920 ms, for no change in the total (b64 + max -12% against b64
+  -3% in one round and -3% in median; 487 ms against 489 ms with tile-major keys and the 4x3 tile).
+  The tile-local `TensorPrimitives.Max` costs what the later pass did, just from a warmer cache.
+  Folding the maximum into the accumulators' stores would avoid the loads and was not built: the
+  whole pass is 11% of attention.
+- **Sweeping the score tile width (64, 96, 256, 512 keys).** Every one inside the noise of the
+  baseline. The comment on that constant said the tile was 4.6 KB; at 128 keys it is 37 KB.
+- **Sweeping the value chunk (40, 160 tokens against 80).** -4% and -1% in the noise, **and not
+  bit-identical**: the chunk is how the reduction over tokens is grouped, so changing it regroups
+  the float32 sums (the output hash differs at 1100 tokens). 80 stays, and it is a numerical
+  choice as much as a cache one.
+
+- **A 512-bit `GemmInt8` tile (`AvxVnni.V512`, new in .NET 11), a shuffle-tree reduction and a
+  row-blocked panel loop.** The isolated tile is 1.39-1.56x the 256-bit one (`tools/vnni`), so the
+  estimate was 5-10% of vision. Built: a 4x4 tile and a 4x1 tile on `Vector512`, the remainder of a
+  64-byte step on 256-bit vectors (the MLP's 4304-wide product has 16 bytes left over), the sixteen
+  horizontal sums per tile replaced by three `vphaddd` and an add a row, and the panel loop reordered so
+  each column group's weights are read from L2 once for a block of 20 activation rows instead of
+  again for every four. **All bit-identical** — the sums are integers, and the output hash over the
+  tower's, the projector's and the decoder's real shapes is the same in every variant — and pinned by an
+  exact-sum test at every remainder, which stays. **None of it is measurably faster:**
+
+  | | sum of best over eight real shapes, vs the old kernels |
+  | --- | --- |
+  | 256-bit tile, shuffle-tree reduction only | +1.3% .. -5.0% |
+  | 512-bit tile alone | -4.1% |
+  | row-blocked loop alone | -5.8% |
+  | 512-bit tile + blocking + reduction (three interleaved runs) | -10.3%, -5.8%, -3.6% |
+
+  Individual shapes ran from -17% to +11% in the same sittings, the 4304-wide product slower than the
+  old kernel in every new variant (+2% to +10%), and the host's spread on each figure was 10-40%.
+  End to end on the 150 dpi page, six interleaved rounds, markdown byte-identical: **page 18.97 s old,
+  19.25 s with the 256-bit tile, 19.03 s with the 512-bit one; vision 9.79 / 9.64 / 9.58 s**, inside
+  spreads of 11-21%. The reason is that the real kernel is nowhere near the tile's ceiling — about
+  205-420 GMAC/s over four threads on these shapes, 50-105 a thread, against 180 (256-bit) and 250
+  (512-bit) for the isolated tile in L1 — so a faster instruction has little to speed up. Row blocking
+  was the test of the obvious cause, weights re-read from L2 every four rows, and it recovered a few
+  percent, not the factor of two the gap allows; **what binds this kernel is not identified**. The
+  isolated tile over-promised for the second time (the outer-product tile was 19% in isolation and 10%
+  in place; this one 40% and under 5%): a tile measured with its operands in L1 says what the
+  instruction can do, not what the product around it does.
 
 ### Traps that make a SIMD microbenchmark lie
 

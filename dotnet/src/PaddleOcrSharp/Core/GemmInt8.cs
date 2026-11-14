@@ -196,7 +196,7 @@ internal static unsafe class GemmInt8
     /// thirty-two; a trailing sixteen are taken on 128-bit lanes.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Tile4x4(byte* x, int k, sbyte* w, int stride, int* sums)
+    internal static void Tile4x4(byte* x, int k, sbyte* w, int stride, int* sums)
     {
         byte* x0 = x, x1 = x + k, x2 = x + (2L * k), x3 = x + (3L * k);
         sbyte* w0 = w, w1 = w + stride, w2 = w + (2L * stride), w3 = w + (3L * stride);
@@ -311,7 +311,7 @@ internal static unsafe class GemmInt8
 
     /// <summary>Four activation rows against one weight row, for the last few columns of a ragged panel.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Tile4x1(byte* x, int k, sbyte* w, int* sums)
+    internal static void Tile4x1(byte* x, int k, sbyte* w, int* sums)
     {
         byte* x0 = x, x1 = x + k, x2 = x + (2L * k), x3 = x + (3L * k);
         Vector256<int> a0 = default, a1 = default, a2 = default, a3 = default;
