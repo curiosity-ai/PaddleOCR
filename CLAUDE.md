@@ -1111,6 +1111,79 @@ buffers faulted in). The dot-form tile is capped at 137 GFLOP/s a thread by some
 VM cannot name: removing its sixteen lane reductions gives 155, a 64-bit loop index and a 2x unroll
 give 138, taller tiles (6x4, 8x2) the same.
 
+### Quantization: what int8 buys, what it costs, and the one flag
+
+Behind `--quantization none|int8|int8-compute` (`WeightQuantization` in the library; the environment
+variable `PADDLEOCR_SHARP_QUANTIZATION` sets the default). Nothing is calibrated: plain
+round-to-nearest, symmetric, one scale per group of weights. Off by default; the default build's
+output is unchanged.
+
+| | what is int8 | scales | speed | disk | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| `none` | nothing | | | 1828 MiB | 2790 MiB |
+| `int8` | decoder projections and `lm_head`, weights only | per 128 weights | decode -28%, page -3% | 1495 MiB | 2547 MiB |
+| `int8-compute` | those, and the tower and projector; **activations too** on products with 32+ rows | per row | **page -38%** | 1070 MiB | 2125 MiB |
+
+Ten pages (a formula document, a table, a book page, an English document, a text line, two scene
+images, the synthetic A4 page at 100 and 40 dpi), one process, 266 s in bf16: **166 s** with
+`int8-compute` (vision 169.4 -> 97.3 s, prefill 32.3 -> 18.9 s, decode 43.5 -> 29.2 s) and 257 s with
+`int8` (decode 43.5 -> 31.4 s, vision and prefill unchanged). The 150 dpi synthetic page: 22.7 s ->
+16.5 s on load, 17.0 s from a stored checkpoint; loading with on-the-fly quantisation costs 1.5 s
+against 0.4 s, so the stored file is better in total.
+
+**Where each speed-up comes from.** Weight-only int8 halves the bytes a decode step streams, and
+decode is bound by exactly that, so it helps decode and nothing else: the tower and the prefill are
+bound by arithmetic, and a narrower weight widened into the same float32 panel is no faster (int8
+widened measured 313-467 GFLOP/s against bf16's 386-464 on the model's shapes). The page-level
+gain needed integer *compute*: a 256-bit `vpdpbusd` does thirty-two multiply-adds, and a
+four-by-four tile of them ran at 207-211 GMAC/s a thread against 67 for the float32 dot tile
+(3.1x). Through `Gemm.Linear` on the model's own shapes it is 1.6-3.0x (735-1170 GFLOP/s
+equivalent against 386-464), smallest on the 1152-column projections where quantising the
+activations is a larger share of the call. The weights are used in place — a row of int8 is the
+contiguous reduction vector the tile wants — so nothing is widened or repacked; activations are
+quantised once per call (once for q, k and v together), shifted to unsigned for the instruction,
+and the shift is undone with each weight row's sum, computed once per matrix. The scale must be one
+per row: a grouped scale needs a conversion and a multiply-add every 128 weights, about half the
+gain. AMX and AVX-512 VNNI are not exposed by .NET 10 here (`AvxVnni`, the 256-bit form, is), so this
+runs at 256 bits; without `AvxVnni` it is weights-only and its output can differ slightly from a
+machine that has it.
+
+**What it costs in recognition**, against the bf16 output of the same ten pages:
+
+| | pages identical | words changed | the synthetic A4 page |
+| --- | --- | --- | --- |
+| float32 control (summation order only) | 10/10 | 0 | exact |
+| vision tower int8 only (per row) | 10/10 | 0 | exact |
+| `int8`, decoder, per row | 8/10 | 9 | exact |
+| `int8`, decoder, per 128 (shipped) | 8/10 | 9 | exact |
+| everything int8, weights only | 7/10 | 11 | one table cell lost at 40 dpi |
+| `int8-compute` (real kernel) | 5/10 | 44 | **a digit changed at 40 dpi** (`53,784` -> `53,794`); exact at 100 dpi |
+| plain int4, per 128 | 4/10 | 134 | plain text changed, a table cell lost |
+
+Everything that changes is on the two LaTeX pages except the following, which are the findings to
+weigh: with `int8-compute` a trailing period drops (`loan.` -> `loan`), a traditional character
+becomes simplified, one book sentence is reworded, and on the 40-dpi stress page — a page at the
+edge of what the model can read, where bf16 itself loses a character — a digit in a table cell
+changed. The formula differences are mostly spacing inside `$...$`, `\begin{array}` column
+specs and `\boxed{}`, with some real misreadings in both directions: bf16 wrote `\kappa^2` for
+`\lambda c^2` (int8 was right), int8 dropped a dot accent (`\dot{M}` -> `M`, int8 wrong). The
+float32 control is identical on all ten pages, so none of this is summation order. Tower weights in
+int8 cost nothing measurable; it is the decoder, and the activations, that cost. The real integer
+kernel differs from its own float emulation on four pages (6/10 identical against 5/10, 32 words
+against 44): the same arithmetic up to rounding, with long greedy decodes amplifying the
+difference, so the two are one distribution and neither is "the" result. Plain int4 is rejected as
+it stands; it would need calibrated rounding (GPTQ, AWQ), which is a different project.
+
+**Files.** `tools/quantization/quantize_checkpoint.py <out> --components dec --group 128` writes the
+`int8` checkpoint (1495 MiB); `--components all --group row` writes the `int8-compute` one (1070
+MiB). An int8 tensor is stored as `I8` with its scales beside it as `<name>.scale` (`F32`,
+`[rows, cols / group]`); the loader reads whatever the file holds, and `--quantization` decides
+only what an unquantised file is turned into on load and whether the integer path may run. The
+Python quantiser and the library's on-the-fly one are the same arithmetic in float32. The
+experiment tooling that produced the table is in the same directory: `make_variant.py` (an exact
+quantise-then-dequantise float32 checkpoint of any scheme), `score_variants.py`, and the
+`PADDLEOCR_SHARP_FAKE_A_BITS` hook, which emulates per-token integer activations without a kernel.
+
 ### Things that looked like wins and were not
 
 Each of these is a plausible optimisation that the benchmark rejected. They are recorded because
@@ -1226,6 +1299,9 @@ comment, and the two cold-start answers that did not work — and the generalise
 - **Aligning the convolution's filters as well as its columns.** Measured +12% on the conv GEMM
   against +35% for the columns, but it needs either a per-call copy of the filters (125 MB over a
   detection, which eats most of the gain) or a second persistent copy. Columns only.
+- **Plain round-to-nearest int4 weights.** Per group of 128: 4/10 pages unchanged, 134 words changed
+  including plain English and a table cell; the weight RMS error is 13.9% against int8's 0.8-1.3%.
+  Not built a kernel for. See "Quantization".
 - **A skinny multi-row decode kernel (widen on the fly, no panel).** Estimated before building it:
   with the worker team in, a four-row step costs about 1.5x a one-row step, and the best this could
   do is bring that to about 1.2x, which over a page's 66 batched steps is about 0.2-0.4 s of 23.
