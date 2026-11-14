@@ -1200,6 +1200,63 @@ experiment tooling that produced the table is in the same directory: `make_varia
 quantise-then-dequantise float32 checkpoint of any scheme), `score_variants.py`, and the
 `PADDLEOCR_SHARP_FAKE_A_BITS` hook, which emulates per-token integer activations without a kernel.
 
+### Attention at large blocks: what a 4900-patch block was spending
+
+With the tower's matrix products in int8, attention is what is left of it. Profiled under
+`--quantization int8-compute` at the 4900-patch block a scanned page produces, attention was **18.9 s
+of a 26.8 s tower (70%)**, the MLP, qkv and output products 21%. Inside attention the thread time
+split 44% scores, 46% values, 11% softmax. That is also why the int8 speed-up fell from 1.5x at
+100 dpi to 1.3x at 400: attention stays float32 and grows with the square of the patch count.
+
+The rate said where to look. 4·n²·72 FLOP a head a layer is 2,990 GFLOP for the tower at 4900
+patches, so 18.9 s is **158 GFLOP/s, against about 270 at 150 dpi** with the same kernels. A rate
+that falls as the problem grows is a cache or bandwidth effect, and the arithmetic of it fits: each
+thread owns a head, so its working set is 1.4 MB of keys, 1.6 MB of values and 0.3 MB of scores,
+more than a 2 MB L2; and every block of 16 query rows streams all of it once for 22.6 MFLOP, about
+7.5 FLOP per byte, which at 158 GFLOP/s is 20 GB/s, the L3 figure measured elsewhere in this file.
+The earlier "row-block sizing" and "taller tiles" entries below were rejected when the kernels were
+half as fast and the stage a fifth of the tower; both conclusions were true then and are not now.
+
+Measured in `bench`-sized isolation (`Attention.Bidirectional`, 16 heads x 4900 tokens x 72, one
+process per configuration, interleaved, the baseline at both ends of every round, best of five
+calls a process, eight rounds). **The host's spread here was 15-35% of the best from round to round,
+so only the large effects below are established; the small ones are not.** All of these are
+bit-identical to the old kernels (checked by hashing the whole output at 1, 37, 129, 1100, 1200,
+2500 and 4900 tokens) except the chunk size.
+
+| Change | 4900 tokens, best / median vs baseline |
+| --- | --- |
+| 8 query rows a block | +17% / +20% (slower) |
+| 32 | -3% / -9% |
+| 64 | -15..-21% / -12..-14% |
+| 128, 256, 512 | -23% / -23..-25% (indistinguishable from each other) |
+| 64 + tile-major keys | -20% / -16% |
+| 64 + 4x3 score tile | -18% / -14% |
+| 64 + tile-major keys + 4x3 tile | -26% / -22% |
+| **128 + tile-major keys + 4x3 tile (shipped)** | **-23% / -25%** (-32% / -25% in an earlier round) |
+
+Frozen into the code and run against the old build, interleaved, 8 rounds: **4900 tokens 603 -> 465 ms
+a call (-22.9%, median -24.6%), 2500 tokens -15.4% (median -8.1%), 1200 tokens -8.9% (median
+-6.8%, inside the noise)**, with the scores kernel's thread time 981 -> 582 ms and the values
+kernel's 1070 -> 852 ms at 4900. Softmax and the transpose are flat, as controls.
+
+- **The query block is the effect.** Every block streams the whole of a head's keys and values, so
+  the rows per block divide that traffic; 128 rows is 2.5 MB of scores at the largest page we
+  accept and still inside L2, and past it nothing more is gained. The block of 16 was chosen at a
+  size where this did not bind.
+- **Tile-major keys.** The transposed keys are stored `[tile][headDim][128]` instead of
+  `[headDim][tokens]`, so one score tile is a single 37 KB sequential read instead of 72 strided
+  ones a whole key row (20 KB) apart: more streams than the prefetcher follows and more pages than
+  the L1 TLB holds. Alone it is within the noise; with the 4x3 tile the scores kernel is 22%
+  faster than with the block change alone (803 -> 629 thread-ms), and the pair is kept.
+- **A 4x3 score tile** (four query rows by three 512-bit vectors, twelve accumulators, 48 keys a
+  step) against 4x2. The leftover columns of a tile go to the 4x2 kernel, and a machine without
+  512-bit vectors never takes it. Every output still accumulates over the head's 72 dimensions in
+  the same order, so it is bit-identical.
+- **`AttentionTests`** pins `Attention.Bidirectional` against a double-precision reference at
+  1, 3, 37, 128, 129, 300, 1000 and 1030 tokens, under the 512-bit path and with
+  `PADDLEOCR_SHARP_VECTOR_BITS=256`; there was no direct test of attention before this.
+
 ### Things that looked like wins and were not
 
 Each of these is a plausible optimisation that the benchmark rejected. They are recorded because
@@ -1220,6 +1277,8 @@ comment, and the two cold-start answers that did not work — and the generalise
 - **Sizing attention's row-block from the token count**, so a page's keys and values are read
   half as many times. No measurable change, which is what rules key and value bandwidth out as
   attention's limit.
+  **Superseded**: re-measured at 4900 patches after the kernels had doubled in speed, the rows per
+  block *is* the effect — 128 against 16 is 23% faster. See "Attention at large blocks".
 - **Giving attention's score product the four-by-four tile `Gemm.Linear` uses.** The argument is
   that `Dot4` issues five loads per four multiply-adds where `Dot4x4` issues eight per sixteen, so
   the wider tile should be load-bound where the narrow one is not. Exactly neutral, and the reason
@@ -1309,6 +1368,9 @@ comment, and the two cold-start answers that did not work — and the generalise
   a `nint` index with the loop unrolled twice measured 138. The tile is not loop-overhead-bound.
 - **Taller score tiles in attention** (6x2, 8x2, 4x3 against 4x2): +10, +14 and +20% in isolation,
   which on a kernel that is 8% of the tower is about 1% of it. Not worth the code.
+  **Partly superseded**: scores are about 30% of the tower's thread time at a 4900-patch block, not
+  8%, and 4x3 is kept (with tile-major keys and 128-row blocks); 8x2 and 6x2 were re-measured and
+  stay rejected — see below.
 - **GC settings for the cold layout detection.** Workstation against server GC, concurrent on and
   off, over three interleaved rounds: first detection 2.3-2.9 s in every configuration, no
   separation. The 0.7 s it costs over a warm one is JIT and first-touch page faults, not collection.
@@ -1323,6 +1385,25 @@ comment, and the two cold-start answers that did not work — and the generalise
   do is bring that to about 1.2x, which over a page's 66 batched steps is about 0.2-0.4 s of 23.
   Not built — **and the estimate was low**: a cold-DRAM measurement later put five rows at 21 GB/s
   against 45 for one, which is about 0.8 s a page (item 6 above). It is the next thing to build.
+
+- **8x2 and 6x2 score tiles, again, at 4900 patches.** Against 4x3, in the same interleaved sitting:
+  8x2 +2.4% / +1.0%, 6x2 +0.4% / -4.6% (best / median) of the baseline, where 4x3 was -3.7% / -9.9%
+  and 4x3 with tile-major keys and 64-row blocks -26% / -22%, 6x2 in that combination -24% / -19%.
+  More accumulators per load is not what limits this kernel; 4x3 covers three vectors of keys a step
+  and is the one kept.
+- **Taking each row's maximum per tile, while the tile is in L1.** The softmax pass's first read of
+  the row is what it removes: softmax thread time fell 257 -> 202 ms (-21%) and the scores kernel
+  rose by about the same, 894 -> 920 ms, for no change in the total (b64 + max -12% against b64
+  -3% in one round and -3% in median; 487 ms against 489 ms with tile-major keys and the 4x3 tile).
+  The tile-local `TensorPrimitives.Max` costs what the later pass did, just from a warmer cache.
+  Folding the maximum into the accumulators' stores would avoid the loads and was not built: the
+  whole pass is 11% of attention.
+- **Sweeping the score tile width (64, 96, 256, 512 keys).** Every one inside the noise of the
+  baseline. The comment on that constant said the tile was 4.6 KB; at 128 keys it is 37 KB.
+- **Sweeping the value chunk (40, 160 tokens against 80).** -4% and -1% in the noise, **and not
+  bit-identical**: the chunk is how the reduction over tokens is grouped, so changing it regroups
+  the float32 sums (the output hash differs at 1100 tokens). 80 stays, and it is a numerical
+  choice as much as a cache one.
 
 ### Traps that make a SIMD microbenchmark lie
 
