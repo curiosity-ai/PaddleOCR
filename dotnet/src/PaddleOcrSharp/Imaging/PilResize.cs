@@ -183,7 +183,7 @@ public static class PilResize
         int height = source.Height;
         int outWidth = destination.Width;
 
-        Parallel.For(0, height, Parallelism.Options, y =>
+        Parallelism.For(height, y =>
         {
             ReadOnlySpan<byte> srcRow = source.Row(y);
             Span<byte> dstRow = destination.Row(y);
@@ -223,7 +223,7 @@ public static class PilResize
         int width = destination.Width;
         int outHeight = destination.Height;
 
-        Parallel.For(0, outHeight, Parallelism.Options, y =>
+        Parallelism.For(outHeight, y =>
         {
             int min = bounds[(y * 2) + 0];
             int count = bounds[(y * 2) + 1];

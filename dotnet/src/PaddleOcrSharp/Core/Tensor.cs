@@ -15,11 +15,13 @@ namespace PaddleOcrSharp.Core;
 public sealed class Tensor : IDisposable
 {
     private float[] _array;
+    private int _offset;
     private readonly bool _pooled;
 
-    private Tensor(float[] array, int[] shape, int length, bool pooled)
+    private Tensor(float[] array, int[] shape, int length, bool pooled, int offset = 0)
     {
         _array = array;
+        _offset = offset;
         _pooled = pooled;
         Shape = shape;
         Length = length;
@@ -38,11 +40,11 @@ public sealed class Tensor : IDisposable
     public Span<float> Span
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _array.AsSpan(0, Length);
+        get => _array.AsSpan(_offset, Length);
     }
 
     /// <summary>The elements as a <see cref="Memory{T}"/>.</summary>
-    public Memory<float> Memory => _array.AsMemory(0, Length);
+    public Memory<float> Memory => _array.AsMemory(_offset, Length);
 
     /// <summary>Size of the last dimension, or <see cref="Length"/> for a rank-0 tensor.</summary>
     public int LastDim => Shape.Length == 0 ? Length : Shape[^1];
@@ -56,8 +58,9 @@ public sealed class Tensor : IDisposable
     public static Tensor Rent(params int[] shape)
     {
         int length = ElementCount(shape);
-        float[] array = TensorPool.RentArray(length);
-        return new Tensor(array, shape, length, pooled: true);
+        float[] array = TensorPool.RentAlignableArray(length);
+        int offset = length == 0 ? 0 : TensorPool.AlignmentOffset(array);
+        return new Tensor(array, shape, length, pooled: true, offset);
     }
 
     /// <summary>Allocates a pooled tensor of the given <paramref name="shape"/>, zero-filled.</summary>
@@ -117,11 +120,11 @@ public sealed class Tensor : IDisposable
 
     /// <summary>Row <paramref name="index"/> of a tensor viewed as <c>[rows, LastDim]</c>.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Span<float> Row(int index) => _array.AsSpan(index * LastDim, LastDim);
+    public Span<float> Row(int index) => _array.AsSpan(_offset + (index * LastDim), LastDim);
 
     /// <summary>A contiguous slice of <paramref name="count"/> rows starting at <paramref name="start"/>.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Span<float> Rows(int start, int count) => _array.AsSpan(start * LastDim, count * LastDim);
+    public Span<float> Rows(int start, int count) => _array.AsSpan(_offset + (start * LastDim), count * LastDim);
 
     /// <summary>
     /// Reinterprets the tensor with a new shape. The element count must be unchanged; one
@@ -185,6 +188,7 @@ public sealed class Tensor : IDisposable
         {
             TensorPool.Return(_array);
             _array = [];
+            _offset = 0;
             Length = 0;
         }
     }

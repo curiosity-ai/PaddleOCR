@@ -10,20 +10,82 @@ namespace PaddleOcrSharp.Core;
 /// to float32 inside the inner loop.
 /// </summary>
 /// <remarks>
-/// Only the two dtypes the shipped checkpoints use are given fast paths: bfloat16 (PaddleOCR-VL)
-/// and float32 (PP-DocLayoutV3). Everything else must be converted at load time.
+/// Only the dtypes the shipped checkpoints use are given fast paths: bfloat16 (PaddleOCR-VL),
+/// float32 (PP-DocLayoutV3) and, optionally, int8 with a float32 scale per group of reduction
+/// elements (<see cref="Int8Weights"/>). Everything else must be converted at load time.
 /// </remarks>
 public readonly struct WeightMatrix
 {
     private readonly ReadOnlyMemory<byte> _bytes;
+    private readonly ReadOnlyMemory<float> _scales;
+    private readonly Int8Companion? _companion;
 
-    private WeightMatrix(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols)
+    /// <summary>What an int8 matrix needs besides its values and scales, computed once and shared by copies.</summary>
+    private sealed class Int8Companion
     {
+        internal volatile int[]? RowSums;
+    }
+
+    private WeightMatrix(
+        ReadOnlyMemory<byte> bytes,
+        DType dtype,
+        int rows,
+        int cols,
+        bool fromCheckpoint,
+        ReadOnlyMemory<float> scales = default,
+        int groupSize = 0,
+        bool computeInt8 = false,
+        Int8Companion? companion = null)
+    {
+        FromCheckpoint = fromCheckpoint;
+        ComputeInt8 = computeInt8;
+        _companion = companion;
+        _scales = scales;
+        GroupSize = groupSize;
         _bytes = bytes;
         Dtype = dtype;
         Rows = rows;
         Cols = cols;
     }
+
+    /// <summary>Whether this is a model weight read from a checkpoint, as opposed to scratch posed as one.</summary>
+    internal bool FromCheckpoint { get; }
+
+    /// <summary>
+    /// Whether products with many rows may quantise their activations too and run on the integer
+    /// dot-product instruction; see <see cref="GemmInt8"/>. Set by the weight store, never by the file.
+    /// </summary>
+    internal bool ComputeInt8 { get; }
+
+    /// <summary>The int8 values of an <see cref="DType.Int8"/> matrix, row-major.</summary>
+    internal ReadOnlySpan<byte> Int8Values => _bytes.Span;
+
+    /// <summary>The group scales of an <see cref="DType.Int8"/> matrix.</summary>
+    internal ReadOnlySpan<float> Int8Scales => _scales.Span;
+
+    /// <summary>This matrix, marked as free to take the integer-activation path.</summary>
+    internal WeightMatrix WithComputeInt8() =>
+        new(_bytes, Dtype, Rows, Cols, FromCheckpoint, _scales, GroupSize, computeInt8: true, _companion);
+
+    /// <summary>
+    /// The sum of each row's int8 values, computed on first use: the correction that turns an unsigned
+    /// activation dot product back into a signed one.
+    /// </summary>
+    internal ReadOnlySpan<int> GetRowSums()
+    {
+        Int8Companion companion = _companion ?? throw new InvalidOperationException("Not an int8 matrix.");
+        int[]? sums = companion.RowSums;
+        if (sums is null)
+        {
+            sums = Int8Weights.RowSums(_bytes.Span, Rows, Cols);
+            companion.RowSums = sums;
+        }
+
+        return sums;
+    }
+
+    /// <summary>Reduction elements per scale for an <see cref="DType.Int8"/> matrix, otherwise 0.</summary>
+    public int GroupSize { get; }
 
     /// <summary>Storage dtype.</summary>
     public DType Dtype { get; }
@@ -56,7 +118,7 @@ public readonly struct WeightMatrix
     }
 
     /// <summary>Wraps raw bytes as a weight matrix.</summary>
-    public static WeightMatrix Create(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols)
+    public static WeightMatrix Create(ReadOnlyMemory<byte> bytes, DType dtype, int rows, int cols, bool fromCheckpoint = false)
     {
         long expected = (long)rows * cols * dtype.ByteSize();
         if (bytes.Length < expected)
@@ -72,7 +134,59 @@ public readonly struct WeightMatrix
                 $"{dtype} weights must be converted to float32 or bfloat16 before use.");
         }
 
-        return new WeightMatrix(bytes, dtype, rows, cols);
+        return new WeightMatrix(bytes, dtype, rows, cols, fromCheckpoint);
+    }
+
+    /// <summary>Wraps int8 values and their group scales as a weight matrix.</summary>
+    /// <param name="values">The int8 values, row-major, one byte each.</param>
+    /// <param name="scales">One float32 scale per group, <c>[rows, cols / groupSize]</c>.</param>
+    /// <param name="groupSize">Reduction elements per scale; divides <paramref name="cols"/>.</param>
+    /// <param name="rows">Number of rows.</param>
+    /// <param name="cols">Number of columns.</param>
+    /// <param name="fromCheckpoint">Whether this is a model weight read from a checkpoint.</param>
+    public static WeightMatrix CreateInt8(
+        ReadOnlyMemory<byte> values,
+        ReadOnlyMemory<float> scales,
+        int groupSize,
+        int rows,
+        int cols,
+        bool fromCheckpoint = false)
+    {
+        if (groupSize <= 0 || cols % groupSize != 0)
+        {
+            throw new ArgumentException($"A group of {groupSize} does not divide {cols} columns.", nameof(groupSize));
+        }
+
+        if (values.Length < (long)rows * cols)
+        {
+            throw new ArgumentException(
+                $"Need {(long)rows * cols} bytes for a [{rows}, {cols}] int8 matrix but only {values.Length} are available.",
+                nameof(values));
+        }
+
+        if (scales.Length < (long)rows * (cols / groupSize))
+        {
+            throw new ArgumentException("Too few scales for the matrix.", nameof(scales));
+        }
+
+        return new WeightMatrix(values, DType.Int8, rows, cols, fromCheckpoint, scales, groupSize, computeInt8: false, new Int8Companion());
+    }
+
+    /// <summary>Quantises this bfloat16 or float32 matrix to int8 with one scale per group.</summary>
+    /// <param name="groupSize">Reduction elements per scale; 0 picks 128 where the row length allows it.</param>
+    /// <returns>The quantised matrix, over newly allocated storage.</returns>
+    public WeightMatrix QuantizeInt8(int groupSize = 0)
+    {
+        if (Dtype == DType.Int8)
+        {
+            return this;
+        }
+
+        int group = groupSize > 0 ? groupSize : Int8Weights.GroupFor(Cols);
+        WeightMatrix source = this;
+        (byte[] values, float[] scales) = Int8Weights.Quantize(
+            (row, destination) => source.CopyRow(row, destination), Rows, Cols, group);
+        return CreateInt8(values, scales, group, Rows, Cols, FromCheckpoint);
     }
 
     /// <summary>Wraps a float32 array as a weight matrix.</summary>
@@ -86,6 +200,13 @@ public readonly struct WeightMatrix
         if (Dtype == DType.Float32)
         {
             return Gemm.Dot(x, MemoryMarshal.Cast<byte, float>(_bytes.Span).Slice(row * Cols, Cols));
+        }
+
+        if (Dtype == DType.Int8)
+        {
+            int groups = Cols / GroupSize;
+            return Int8Weights.Dot(
+                x, _bytes.Span.Slice(row * Cols, Cols), _scales.Span.Slice(row * groups, groups), GroupSize);
         }
 
         return DotBF16(x, MemoryMarshal.Cast<byte, ushort>(_bytes.Span).Slice(row * Cols, Cols));
@@ -112,6 +233,14 @@ public readonly struct WeightMatrix
             return;
         }
 
+        if (Dtype == DType.Int8)
+        {
+            Int8Weights.Dot4(
+                x, _bytes.Span, row, Cols, _scales.Span, GroupSize, row + 16 <= Rows ? 8 * Cols : 0,
+                out a0, out a1, out a2, out a3);
+            return;
+        }
+
         ReadOnlySpan<ushort> raw = MemoryMarshal.Cast<byte, ushort>(_bytes.Span);
         int start = row * Cols;
         DotBF16x4(
@@ -134,6 +263,12 @@ public readonly struct WeightMatrix
         {
             MemoryMarshal.Cast<byte, float>(_bytes.Span).Slice(row * Cols, Cols).CopyTo(destination);
         }
+        else if (Dtype == DType.Int8)
+        {
+            int groups = Cols / GroupSize;
+            Int8Weights.DequantizeRow(
+                _bytes.Span.Slice(row * Cols, Cols), _scales.Span.Slice(row * groups, groups), GroupSize, destination[..Cols]);
+        }
         else
         {
             FloatConversion.BF16ToFloat(
@@ -154,6 +289,13 @@ public readonly struct WeightMatrix
         {
             MemoryMarshal.Cast<byte, float>(_bytes.Span).Slice(start, length).CopyTo(destination);
         }
+        else if (Dtype == DType.Int8)
+        {
+            for (int r = 0; r < count; r++)
+            {
+                CopyRow(row + r, destination.Slice(r * Cols, Cols));
+            }
+        }
         else
         {
             FloatConversion.BF16ToFloat(
@@ -167,6 +309,10 @@ public readonly struct WeightMatrix
         if (Dtype == DType.Float32)
         {
             MemoryMarshal.Cast<byte, float>(_bytes.Span)[..(Rows * Cols)].CopyTo(destination);
+        }
+        else if (Dtype == DType.Int8)
+        {
+            CopyRows(0, Rows, destination);
         }
         else
         {

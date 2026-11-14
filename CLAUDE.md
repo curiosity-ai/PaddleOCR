@@ -932,6 +932,274 @@ real A4-landscape page at about 70 dpi. What is left at 78 s is 45 s of vision o
 much less — 12.5 s of prefill, 15.6 s of decode for 1,737 tokens, and 3.5 s of layout. Getting
 under sixty would take a materially better GEMM, not another pass over this pipeline.
 
+### Alignment and the worker team: what a four-core page was spending that no kernel profile showed
+
+A synthetic A4 page (title, three paragraphs, a 7x4 table; `tools/dpi_study/`) parses to byte-identical
+markdown at every resolution from 40 to 400 dpi and falls apart below 35, so 100 and 150 dpi are the
+cheapest settings that still read it. Those two pages were profiled and tuned; what follows is the
+record. Machine: 4 cores, Xeon with AVX-512 (`avx512_fp16`, AMX present but unreachable from .NET).
+Whole process, cold, interleaved base against final, three runs each, best of three with the spread:
+
+| Page | before | after | | vision | prefill | decode | layout |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 dpi | 28.7 s (4.8%) | **17.7 s** (4.9%) | 1.62x | 14.6 -> 9.1 s | 3.0 -> 1.8 s | 7.8 -> 4.0 s | 3.1 -> 2.5 s |
+| 150 dpi | 36.0 s (2.8%) | **23.0 s** (2.3%) | 1.57x | 20.2 -> 13.2 s | 3.9 -> 2.4 s | 8.3 -> 4.5 s | 3.2 -> 2.6 s |
+
+The markdown is byte-identical on all twelve runs (`md5 5cfc8ef5` at both resolutions), so this is
+the same work in less time, and so are the GEMM outputs: every one of ten shapes hashes the same
+before and after. Allocation per page is unchanged (1.2-1.3 GiB, of which 1.0 GiB is the layout
+arena filling cold) and so is peak RSS (2.77 against 2.79 GiB). `--block-concurrency 2`,
+`--max-parallelism 2` and `1` all keep identical output and are faster too (29.3 -> 20.5, 44.6 -> 33.1,
+77.4 -> 59.5 s at 100 dpi).
+
+**The ceilings first, because the calibration in `bench` is not to be trusted on this machine.** Its
+FMA figure came out at 988 GFLOP/s for one thread (and 1397 after a "fix" that was reverted): about
+4.4x the 224 GFLOP/s an independent twelve-chain `a = a*m + c` loop sustains, which scales linearly to
+874 over four threads. The same loop as `bench` writes it ran at 47 GFLOP/s in a separate process and
+at roughly one iteration per cycle in the CLI — twelve FMAs per cycle, which no core does — so the
+loop's behaviour depends on how it is compiled, and no absolute figure from it was used here.
+Streaming read bandwidth, measured separately, is 45-49 GB/s over four threads and 15.8 over one.
+Against 224 and 874, the tower's GEMMs were at 28% of peak, and decode streamed weights at
+18.6 GB/s against 45. That is what said there was something to find.
+
+**1. 512-bit loads from a .NET array always straddle two cache lines.** An array's elements start
+sixteen bytes past its header, so no pooled buffer was 64-byte aligned, and every `vmovups zmm` from
+one touched two lines. The four-by-four GEMM tile issues eight loads per sixteen FMAs, and split
+loads doubled that to sixteen per eight cycles — both load ports. It was found by cloning the
+library's panel structure in a harness and removing pieces one at a time until the one that moved the
+number was the buffer's address: the same loop over `NativeMemory.AlignedAlloc` buffers ran 483
+GFLOP/s at four threads against 331, aligned weight panel alone 450. `TensorPool.Rent` and
+`Tensor.Rent` now start their usable region on a cache line (`AlignmentOffset`), which fixes the
+activations, the attention buffers and the GEMM's widened panel at once; the convolution's im2col
+columns, rented as bytes, got the same. Alignment moves data and changes no arithmetic, so it is
+bit-identical by construction; `AlignmentTests` pins both the alignment and that a GEMM gives the
+same bits either way. Tower, 1368 patches: 6.20 -> 4.74 s; conv GEMM 312 -> 421-468 GFLOP/s; warm
+layout detection 2.5-2.76 -> 1.79-2.0 s. The address is read without pinning, so a gen0 array that a
+collection relocates can end up misaligned — a speed loss and never a wrong answer, and the arrays
+where it matters are in the large-object heap, which does not move; the test asserts alignment only
+there.
+
+**2. The same tile on raw pointers is 1.7x the span-indexed one.** `Dot4x4` indexed spans, so each of
+its eight loads per step carried a bounds check and its own address arithmetic: 80 GFLOP/s a thread
+against 135-142 for the identical tile on pointers (one thread, panel in L2). `Tile4x4Wide` is that
+tile, with the same per-lane accumulation order and the same final reduction, writing straight into
+`y` instead of through a scratch tile; the span version stays for 256-bit machines and for lengths
+that are not a multiple of sixteen. In the full four-thread GEMM it was worth only 8% until the
+alignment above, which is the order those two findings came in and why the second looked like a
+small win for a while.
+
+**3. `Parallel.For` parks its workers, and waking them costs more than a decode step's regions last.**
+The decode step is a hundred and thirty parallel regions of 20-400 us, and a streaming read split
+into per-matrix regions ran 29 GB/s against 57 with no region boundary. Per-thread busy time inside
+one 12 MB region came out 388 / 395 / 186 / 117 us: two of four workers joined after the other two
+had finished most of it, which is one and a half threads of work on four cores. Dispatch itself is
+5 us hot, so the cost was never the fork-join; it was the wake-up of a thread that had parked during
+the previous region. `WorkTeam` is the answer: three helpers that spin for 300 us after their last
+region before they park, dynamic claiming (in blocks when there are many items), the caller as the
+fourth worker, `Parallelism.For` as the one entry point, and `Parallel.For` as the fallback whenever
+the team is in use — a region nested in a region, or a second block's tower under
+`--block-concurrency`. Cancellation and exceptions surface as `Parallel.For` surfaces them, and the
+helpers adopt the caller's `Parallelism` scope while they work (`WorkTeamTests`). Single-row GEMM at
+DRAM speed went 456-496 -> 267-343 us (up to 47 GB/s, the ceiling), four rows 759-808 -> 402-422;
+decode -45%, and the tower, whose regions are milliseconds, still gained 11% (4.54-4.74 -> 4.06 s on
+1368 patches), though which of its stages that came from was not separated. Two details that cost a measurement each: the caller's wait for stragglers must not be
+`SpinWait.SpinOnce`, which escalates to `Thread.Sleep(1)` — the first version of the team made
+multi-row calls *slower* for exactly that reason — and publishing a region and parking a helper both
+need a full fence, because each reads what the other just wrote and a store followed by a load may
+reorder.
+
+**4. What the attention kernels needed was smaller than it looked.** Padding the transposed keys and
+score rows to a multiple of sixteen floats, and the per-head value and output rows to 80 (five cache
+lines where 72 floats is four and a half), took the score kernel 5-10% and the value kernel nothing,
+bit-identically. Attention is 21% of the tower, so that is 1-2% of it; it stays because it is free.
+
+**5. The outer-product tile, built and left opt-in (`PADDLEOCR_SHARP_GEMM=outer`).** The one change
+here that is not bit-identical, so it was built and measured separately. Lanes run along activation
+rows instead of along the reduction: activations are packed once per call into `[k][32]` groups
+(the last zero-padded), weights stay in the row-major panel and are read by broadcast, and a tile of
+thirty-two rows by eight columns keeps sixteen independent chains with nothing to reduce afterwards.
+Reductions longer than 1152 are cut into chunks with the accumulators carried through memory, which
+is the same sequential chain resumed; without that the two large-reduction shapes gained 2% and 7%
+where the others gained 22%, because four 551 KB row groups no longer fit L2. Carrying the resume
+as a flag on the hot kernel cost the JIT its register allocation (a 520 GFLOP/s kernel measured
+280), so resuming is a separate copy of each kernel.
+
+| | dot form | outer form | |
+| --- | --- | --- | --- |
+| tower qkv / proj, 1368 rows | 428 | 477 GFLOP/s | 1.11x |
+| tower MLP up | 435 | 518 | 1.19x |
+| tower MLP down (K 4304) | 349 | 405 | 1.16x |
+| projector (K 4608) | 333 | 422 | 1.27x |
+| prefill qkv / MLP | 403 / 404 | 474 / 481 | 1.18-1.19x |
+
+Medians of five interleaved rounds, spread 2-5%. What it is worth on a page is much less, because
+the GEMMs are about two thirds of the tower and the tower is a bit over half of the page: 150 dpi
+21.8 -> 20.7 s (mean of three interleaved runs; best 21.4 -> 20.1 s), 100 dpi within noise, vision
+12.3 -> 11.6 s, layout convolutions 957-1103 -> 862-959 ms. A projection of 10% for the whole page,
+made from the isolated kernel, came out at about half that.
+
+**Why the page gains about a third of what the kernel does.** The 19% on the tower's MLP shape
+becomes 10% of the tower's MLP stage in place (stage medians, dot against outer: MLP 2112 -> 1899
+ms, qkv 879 -> 840, out 300 -> 280), for two reasons. The activations are repacked on every call,
+and three projections that share one input repack it three times: 4-5% of the GEMM time, 3% of the
+tower, measured with a temporary stopwatch. The rest of the gap was not isolated; the harness calls
+one matrix repeatedly, so its weights sit in L3, where the tower streams each layer's from memory.
+And the tile only reaches half of a page. At 150 dpi, estimated from the tower's and the prefill's
+stage profiles (GEMM 67% of the tower, 71% of the prefill, attention 24% and 20%):
+
+| | s | GEMM tile | the rest |
+| --- | --- | --- | --- |
+| vision | 12.0 | 8.0 | attention 2.9, shuffles / norms / residuals 1.1 |
+| prefill | 2.25 | 1.6 | attention 0.45, the rest 0.2 |
+| decode (fewer than 32 rows, memory-bound) | 4.1 | 0 | all of it |
+| layout | 2.3 | 0.6 | other operators ~0.9, cold start ~0.5, im2col and copies |
+
+About 10 of 20.6 s is GEMM tile; 9% of that is 0.9 s, which is what was measured. The largest
+untouched items are decode (20% of the page, 2.3-2.8 s from its streaming floor), attention (16%,
+at about 270 GFLOP/s of 860), and a floor no kernel moves: the five-token title block costs 2.0 s
+of vision because `min_pixels` hands the tower 672 patches however little it says.
+
+**Accuracy, which is the reason it is opt-in and not the reason to doubt it.** Per product, a
+sequential float32 chain has 2.3-2.5x the rounding error of the dot form against a float64
+reference (mean relative error 1.7e-6 against 7.5e-7 at a reduction of 1152, 3.7e-6 against 1.5e-6
+at 4304); the two orders' results differ in the low bits of 95-98% of outputs. After 27 layers and
+the projector the vision embeddings differ by a relative L2 of 4.0e-6 and 4.7e-6 (a text and a title
+block) and 5.1e-5 (a table block), worst per-token cosine similarity 0.9999992. And on the synthetic
+A4 page at fifteen resolutions from 20 to 400 dpi, **the markdown is byte-identical to the dot
+form's at every one**, including 20-35 dpi where the recognised text is wrong (CER 73.5% down to 2.8%)
+and greedy decoding has the least margin to spare: text CER, word recall and table cells match to the
+digit at all fifteen (`tools/dpi_study/REPORT.md`). That is one document, a few hundred tokens a
+resolution, and decode still runs the dot form (it has fewer than 32 rows); the corpus is what
+would move this from opt-in to default, and `GemmOuterTests` pins the accuracy per product against a
+float64 reference in the meantime.
+
+**6. Projections that share an input are computed together, and nothing else about the weights is
+worth doing ahead of time.** `Gemm.LinearMany` takes a layer's query, key and value (and the decoder's
+gate and up) as one call: the activations are packed once instead of three times, and all the
+projections' column panels run in one parallel region, so a decode step has four region boundaries a
+layer where it had seven. It reads the weights where they lie rather than concatenating them, which
+would have copied 215 MB out of the memory-mapped checkpoint. Each output is bit-identical to a
+call of its own in both accumulation orders (`GemmManyTests`). Interleaved on a page, best of three,
+before -> after: vision 12.8 -> 11.9 s and prefill 2.31 -> 2.13 s with the outer tile on, 13.3 ->
+12.9 and 2.50 -> 2.32 without; markdown byte-identical in all four configurations. A single-row
+decode step went 18.2 -> 16.4 ms at best of three, but the other two rounds were flat (19.6 against
+18.8, 20.9 against 21.2), so a decode gain is not established.
+
+What else was checked as work to do once, at load, instead of per call:
+
+| Candidate | Measured | Verdict |
+| --- | --- | --- |
+| Align the weights in memory | 77% of the checkpoint's bytes sit at 32 mod 64, the rest at 0. Cold single-row decode streams at 44.8-46.4 GB/s from offset 0 and 45.1-47.4 from offset 32; five rows 20.6-22.9 against 20.3-23.6 | No effect. The weight loaders use 32-byte loads, which cannot straddle a line at 32-byte alignment; the 512-bit loads that did are on activations and panels |
+| Widen bf16 to float32 once | Widening is 7.7 Gelem/s a thread: about 11 ms a tower pass, 0.25% of it | Nothing to save in the tower; float32 weights would double the bytes a decode step streams, which is what bounds it |
+| Pre-fault the memory-mapped weights | A first tower pass costs 0-1.25 s more than the fourth (0.1 s in two of three runs); a page takes 325k minor faults for 0.8-0.9 s of system time spread over four cores | At most a couple of tenths of a second, and moving the faults would not remove them |
+| Concatenate q/k/v and gate/up | `LinearMany` gets the same sharing without the copy | Not needed |
+| Fold the norm scale and shift, or the attention scale, into the next weights | Would re-round bf16 weights | Not bit-identical and not a float32 rounding difference but a change to the model; rejected |
+| Fold batch norm into the layout convolutions | `batch_norm_` is 25 ms of a 1.8 s detection | 1.4%, and not bit-identical |
+| Keep an aligned copy of the convolution filters | +12% of the conv GEMM (about 0.07 s), 125 MB resident | Possible, small |
+
+The one place the weights are re-processed on every call and it shows is the batched decode step: a
+five-row step streams at about 21 GB/s where a one-row step streams at 45, because rows 4 and up
+widen each panel into a float32 scratch before using it. That cannot be precomputed away (see the
+float32 row above); it is the case for the skinny widen-on-the-fly kernel, and the measured gap is
+larger than the earlier estimate under "Things that looked like wins": 66 batched steps a page at
+16 ms each is about 0.8 s, 4% of it.
+
+What is left, at 150 dpi: the tower's GEMMs are at 410-420 GFLOP/s (48% of peak, 86% of what the
+bare tile does on four threads), decode is at 20 ms a step against a 14 ms streaming floor, and a
+cold layout detection is 0.7 s slower than a warm one (JIT with tiering off, and 811 MiB of arena
+buffers faulted in). The dot-form tile is capped at 137 GFLOP/s a thread by something a counter-less
+VM cannot name: removing its sixteen lane reductions gives 155, a 64-bit loop index and a 2x unroll
+give 138, taller tiles (6x4, 8x2) the same.
+
+### Quantization: what int8 buys, what it costs, and the one flag
+
+Behind `--quantization none|int8-compute` (`WeightQuantization` in the library; the environment
+variable `PADDLEOCR_SHARP_QUANTIZATION` sets the default). Nothing is calibrated: plain
+round-to-nearest, symmetric, one scale per output row. Off by default; the default build's output is
+unchanged. `int8-compute` makes the vision tower, the projector and the decoder int8, and runs every
+product with 32 rows or more in integer arithmetic on quantised activations (see below).
+
+**There was a weight-only `int8` mode and it was removed.** It quantised the decoder and `lm_head` to
+int8 with a scale per 128 weights, which cut decode by 28% and a page by 3% (257 s against 266 s over
+the ten-page set), because the tower and prefill are bound by arithmetic and a narrower weight does
+nothing for them. Not worth a second checkpoint to publish and a second set of recognition results to
+explain next to the one that is worth it.
+
+| | what is int8 | speed | disk | peak RSS |
+| --- | --- | --- | --- | --- |
+| `none` | nothing | | 1828 MiB | 2790 MiB |
+| `int8-compute` | tower, projector, decoder; **activations too** on products with 32+ rows | **page -38%** | 1070 MiB | 2125 MiB |
+
+`--quantization int8-compute` also selects what `download` fetches and what a parse downloads when
+the cache is empty: `paddleocr-vl/int8-compute/model.safetensors` (1,121,856,264 bytes), with the
+tokenizer and configs taken from the original `paddleocr-vl/` directory, since only the weights differ
+(`ModelFile.RemotePath`, `ModelCatalog.PaddleOcrVL16Int8Compute`). The mirror answers a missing object
+with HTTP 200 and the text `Object Not Found`, so the downloader checks for that body rather than
+trusting the status. An explicit `--model-dir` is used as it is, bf16 or int8.
+
+Ten pages (a formula document, a table, a book page, an English document, a text line, two scene
+images, the synthetic A4 page at 100 and 40 dpi), one process, 266 s in bf16: **166 s** with
+`int8-compute` (vision 169.4 -> 97.3 s, prefill 32.3 -> 18.9 s, decode 43.5 -> 29.2 s). The 150 dpi
+synthetic page: 22.7 s -> 16.5 s on load, 17.0 s from a stored checkpoint; loading with on-the-fly
+quantisation costs 1.5 s against 0.4 s, so the stored file is better in total. Over the fifteen
+resolutions of the synthetic A4 page, from the downloaded checkpoint, the whole run is 492.0 s ->
+354.7 s (1.39x), 1.4-1.5x for 45-200 dpi and 1.3x above, with **byte-identical markdown at every
+resolution from 45 dpi up** and differing text only where bf16 is itself already wrong
+(`tools/dpi_study/REPORT.md`).
+
+**Where each speed-up comes from.** Weight-only int8 halves the bytes a decode step streams, and
+decode is bound by exactly that, so it helps decode and nothing else (the mode that was removed): the tower and the prefill are
+bound by arithmetic, and a narrower weight widened into the same float32 panel is no faster (int8
+widened measured 313-467 GFLOP/s against bf16's 386-464 on the model's shapes). The page-level
+gain needed integer *compute*: a 256-bit `vpdpbusd` does thirty-two multiply-adds, and a
+four-by-four tile of them ran at 207-211 GMAC/s a thread against 67 for the float32 dot tile
+(3.1x). Through `Gemm.Linear` on the model's own shapes it is 1.6-3.0x (735-1170 GFLOP/s
+equivalent against 386-464), smallest on the 1152-column projections where quantising the
+activations is a larger share of the call. The weights are used in place — a row of int8 is the
+contiguous reduction vector the tile wants — so nothing is widened or repacked; activations are
+quantised once per call (once for q, k and v together), shifted to unsigned for the instruction,
+and the shift is undone with each weight row's sum, computed once per matrix. The scale must be one
+per row: a grouped scale needs a conversion and a multiply-add every 128 weights, about half the
+gain. AMX and AVX-512 VNNI are not exposed by .NET 10 here (`AvxVnni`, the 256-bit form, is), so this
+runs at 256 bits; without `AvxVnni` it is weights-only and its output can differ slightly from a
+machine that has it.
+
+**What it costs in recognition**, against the bf16 output of the same ten pages:
+
+| | pages identical | words changed | the synthetic A4 page |
+| --- | --- | --- | --- |
+| float32 control (summation order only) | 10/10 | 0 | exact |
+| vision tower int8 only (per row) | 10/10 | 0 | exact |
+| decoder only, per row (experiment) | 8/10 | 9 | exact |
+| decoder only, per 128 (the removed `int8` mode) | 8/10 | 9 | exact |
+| everything int8, weights only (experiment) | 7/10 | 11 | one table cell lost at 40 dpi |
+| `int8-compute` (real kernel) | 5/10 | 44 | **a digit changed at 40 dpi** (`53,784` -> `53,794`); exact at 100 dpi |
+| plain int4, per 128 | 4/10 | 134 | plain text changed, a table cell lost |
+
+Everything that changes is on the two LaTeX pages except the following, which are the findings to
+weigh: with `int8-compute` a trailing period drops (`loan.` -> `loan`), a traditional character
+becomes simplified, one book sentence is reworded, and on the 40-dpi stress page — a page at the
+edge of what the model can read, where bf16 itself loses a character — a digit in a table cell
+changed. The formula differences are mostly spacing inside `$...$`, `\begin{array}` column
+specs and `\boxed{}`, with some real misreadings in both directions: bf16 wrote `\kappa^2` for
+`\lambda c^2` (int8 was right), int8 dropped a dot accent (`\dot{M}` -> `M`, int8 wrong). The
+float32 control is identical on all ten pages, so none of this is summation order. Tower weights in
+int8 cost nothing measurable; it is the decoder, and the activations, that cost. The real integer
+kernel differs from its own float emulation on four pages (6/10 identical against 5/10, 32 words
+against 44): the same arithmetic up to rounding, with long greedy decodes amplifying the
+difference, so the two are one distribution and neither is "the" result. Plain int4 is rejected as
+it stands; it would need calibrated rounding (GPTQ, AWQ), which is a different project.
+
+**Files.** `tools/quantization/quantize_checkpoint.py <out>` writes the `int8-compute` checkpoint
+(1070 MiB; its defaults are `--components all --group row`), which is what the mirror holds;
+`--components dec --group 128` writes the weight-only experiment's. An int8 tensor is stored as `I8` with its scales beside it as `<name>.scale` (`F32`,
+`[rows, cols / group]`); the loader reads whatever the file holds, and `--quantization` decides
+only what an unquantised file is turned into on load and whether the integer path may run. The
+Python quantiser and the library's on-the-fly one are the same arithmetic in float32. The
+experiment tooling that produced the table is in the same directory: `make_variant.py` (an exact
+quantise-then-dequantise float32 checkpoint of any scheme), `score_variants.py`, and the
+`PADDLEOCR_SHARP_FAKE_A_BITS` hook, which emulates per-token integer activations without a kernel.
+
 ### Things that looked like wins and were not
 
 Each of these is a plausible optimisation that the benchmark rejected. They are recorded because
@@ -1032,6 +1300,29 @@ comment, and the two cold-start answers that did not work — and the generalise
   GEMM variant measured slower than the 256-bit kernel, including a narrowed tile chosen to fit
   the register file. See `Core/Simd.cs`; the override is left to whoever measures their own
   machine.
+- **An outer-product GEMM tile, as the default.** Built and measured (item 5 above), and shipped
+  opt-in rather than on: the GEMMs gain 11-27% but a page only 2-6%, and the project's bar is
+  byte-identical output checked over a corpus that was not to hand. Turning it on is the one-line
+  change to `GemmOuter.Enabled`.
+- **Taller tiles, a 64-bit loop index and a 2x unroll for the dot-form tile.** 6x4 and 8x2 measured
+  136-137 against 136-142 for 4x4 (same accumulation order, so they would have been bit-identical);
+  a `nint` index with the loop unrolled twice measured 138. The tile is not loop-overhead-bound.
+- **Taller score tiles in attention** (6x2, 8x2, 4x3 against 4x2): +10, +14 and +20% in isolation,
+  which on a kernel that is 8% of the tower is about 1% of it. Not worth the code.
+- **GC settings for the cold layout detection.** Workstation against server GC, concurrent on and
+  off, over three interleaved rounds: first detection 2.3-2.9 s in every configuration, no
+  separation. The 0.7 s it costs over a warm one is JIT and first-touch page faults, not collection.
+- **Aligning the convolution's filters as well as its columns.** Measured +12% on the conv GEMM
+  against +35% for the columns, but it needs either a per-call copy of the filters (125 MB over a
+  detection, which eats most of the gain) or a second persistent copy. Columns only.
+- **Plain round-to-nearest int4 weights.** Per group of 128: 4/10 pages unchanged, 134 words changed
+  including plain English and a table cell; the weight RMS error is 13.9% against int8's 0.8-1.3%.
+  Not built a kernel for. See "Quantization".
+- **A skinny multi-row decode kernel (widen on the fly, no panel).** Estimated before building it:
+  with the worker team in, a four-row step costs about 1.5x a one-row step, and the best this could
+  do is bring that to about 1.2x, which over a page's 66 batched steps is about 0.2-0.4 s of 23.
+  Not built — **and the estimate was low**: a cold-DRAM measurement later put five rows at 21 GB/s
+  against 45 for one, which is about 0.8 s a page (item 6 above). It is the next thing to build.
 
 ### Traps that make a SIMD microbenchmark lie
 
@@ -1040,7 +1331,10 @@ indexed accumulator that is never enregistered — each report roughly a fifth o
 looking entirely reasonable, and all three were hit while building the calibration above. They
 generalise past this port, so they live in
 [`measuring-performance`](.claude/skills/measuring-performance/SKILL.md) §6 with the rest of the
-method. Read that before writing a microbenchmark; `MachineProfile.cs` is the worked example.
+method. Read that before writing a microbenchmark; `MachineProfile.cs` is the worked example of the
+traps, and also of a fourth: its absolute figures were found wrong by 4.4x on the machine of the
+latest pass (see "Alignment and the worker team"), so cross-check a ceiling against an independent
+loop before dividing anything by it.
 
 ## What the pipeline does beyond the models
 

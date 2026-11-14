@@ -264,7 +264,7 @@ internal static class LinearOps
         multiplier.CopyTo(scale);
         offset.CopyTo(shift);
 
-        Parallel.For(0, batch * channels, Parallelism.Options, plane =>
+        Parallelism.For(batch * channels, plane =>
         {
             int c = plane % channels;
             int start = plane * spatial;

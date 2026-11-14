@@ -113,7 +113,8 @@ public static class ParseCommand
 
         var clock = Stopwatch.StartNew();
         using DocumentParser parser = DocumentParser.Load(
-            modelDirectory, layoutDirectory, orientationDirectory, unwarpingDirectory);
+            modelDirectory, layoutDirectory, orientationDirectory, unwarpingDirectory,
+            ModelLocator.QuantizationFrom(command));
         Console.Error.WriteLine($"Models loaded in {clock.Elapsed.TotalSeconds:F1}s");
         RecognitionProfile? profile = options.Profile;
         PageProfile? stages = options.StageProfile;

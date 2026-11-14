@@ -34,7 +34,7 @@ public sealed class ErnieDecoder
         _config = config;
         _rope = new MRotaryEmbedding(config);
         _embeddings = weights.Matrix(prefix + "embed_tokens.weight");
-        _lmHead = weights.Matrix(lmHeadName);
+        _lmHead = weights.Matrix(lmHeadName, WeightRole.Decoder);
         _finalNorm = weights.Vector(prefix + "norm.weight");
 
         _layers = new LayerWeights[config.NumHiddenLayers];
@@ -45,13 +45,13 @@ public sealed class ErnieDecoder
             {
                 InputNorm = weights.Vector(layer + "input_layernorm.weight"),
                 PostAttentionNorm = weights.Vector(layer + "post_attention_layernorm.weight"),
-                Query = weights.Matrix(layer + "self_attn.q_proj.weight"),
-                Key = weights.Matrix(layer + "self_attn.k_proj.weight"),
-                Value = weights.Matrix(layer + "self_attn.v_proj.weight"),
-                Output = weights.Matrix(layer + "self_attn.o_proj.weight"),
-                Gate = weights.Matrix(layer + "mlp.gate_proj.weight"),
-                Up = weights.Matrix(layer + "mlp.up_proj.weight"),
-                Down = weights.Matrix(layer + "mlp.down_proj.weight"),
+                Query = weights.Matrix(layer + "self_attn.q_proj.weight", WeightRole.Decoder),
+                Key = weights.Matrix(layer + "self_attn.k_proj.weight", WeightRole.Decoder),
+                Value = weights.Matrix(layer + "self_attn.v_proj.weight", WeightRole.Decoder),
+                Output = weights.Matrix(layer + "self_attn.o_proj.weight", WeightRole.Decoder),
+                Gate = weights.Matrix(layer + "mlp.gate_proj.weight", WeightRole.Decoder),
+                Up = weights.Matrix(layer + "mlp.up_proj.weight", WeightRole.Decoder),
+                Down = weights.Matrix(layer + "mlp.down_proj.weight", WeightRole.Decoder),
             };
         }
     }
@@ -147,9 +147,15 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("qkv gemm"))
             {
-                Gemm.Linear(normed.Memory, tokenCount, width, layer.Query, default, queries.Memory, queryWidth);
-                Gemm.Linear(normed.Memory, tokenCount, width, layer.Key, default, keys.Memory, keyValueWidth);
-                Gemm.Linear(normed.Memory, tokenCount, width, layer.Value, default, values.Memory, keyValueWidth);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    tokenCount,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Query, default, queries.Memory),
+                        new Gemm.LinearPart(layer.Key, default, keys.Memory),
+                        new Gemm.LinearPart(layer.Value, default, values.Memory),
+                    ]);
             }
 
             using (profile?.Measure("rope"))
@@ -197,10 +203,14 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("mlp gemm"))
             {
-                Gemm.Linear(
-                    normed.Memory, tokenCount, width, layer.Gate, default, gate.Memory, _config.IntermediateSize);
-                Gemm.Linear(
-                    normed.Memory, tokenCount, width, layer.Up, default, up.Memory, _config.IntermediateSize);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    tokenCount,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Gate, default, gate.Memory),
+                        new Gemm.LinearPart(layer.Up, default, up.Memory),
+                    ]);
             }
 
             using (profile?.Measure("silu"))
@@ -319,9 +329,15 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("qkv gemm"))
             {
-                Gemm.Linear(normed.Memory, batch, width, layer.Query, default, queries.Memory, queryWidth);
-                Gemm.Linear(normed.Memory, batch, width, layer.Key, default, keys.Memory, keyValueWidth);
-                Gemm.Linear(normed.Memory, batch, width, layer.Value, default, values.Memory, keyValueWidth);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    batch,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Query, default, queries.Memory),
+                        new Gemm.LinearPart(layer.Key, default, keys.Memory),
+                        new Gemm.LinearPart(layer.Value, default, values.Memory),
+                    ]);
             }
 
             using (profile?.Measure("rope"))
@@ -372,8 +388,14 @@ public sealed class ErnieDecoder
 
             using (profile?.Measure("mlp gemm"))
             {
-                Gemm.Linear(normed.Memory, batch, width, layer.Gate, default, gate.Memory, _config.IntermediateSize);
-                Gemm.Linear(normed.Memory, batch, width, layer.Up, default, up.Memory, _config.IntermediateSize);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    batch,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Gate, default, gate.Memory),
+                        new Gemm.LinearPart(layer.Up, default, up.Memory),
+                    ]);
             }
 
             using (profile?.Measure("silu"))
@@ -421,12 +443,9 @@ public sealed class ErnieDecoder
     {
         float scale = _config.AttentionScale;
 
-        Parallel.For(
-            0,
+        Parallelism.For(
             batch * queryHeads,
-            Parallelism.Options,
-            () => TensorPool.Rent(longest),
-            (index, _, scores) =>
+            index =>
             {
                 int sequence = index / queryHeads;
                 int head = index % queryHeads;
@@ -438,7 +457,8 @@ public sealed class ErnieDecoder
                 ReadOnlySpan<float> valueSpan = cache.ValueWindow(layer, limit).Span;
                 ReadOnlySpan<float> query = queries.Span
                     .Slice((sequence * queryWidth) + (head * headDim), headDim);
-                Span<float> scoreSpan = scores.Span[..limit];
+                using PooledBuffer scores = TensorPool.Rent(limit);
+                Span<float> scoreSpan = scores.Span;
 
                 int keyOffset = keyValueHead * headDim;
                 for (int j = 0; j < limit; j++)
@@ -458,10 +478,7 @@ public sealed class ErnieDecoder
                         Kernels.AddScaled(target, valueSpan.Slice((j * keyValueWidth) + keyOffset, headDim), weight);
                     }
                 }
-
-                return scores;
-            },
-            scores => scores.Dispose());
+            });
     }
 
     /// <summary>
@@ -542,12 +559,9 @@ public sealed class ErnieDecoder
         ReadOnlyMemory<float> keyMemory = cache.KeyWindow(layer, visible);
         ReadOnlyMemory<float> valueMemory = cache.ValueWindow(layer, visible);
 
-        Parallel.For(
-            0,
+        Parallelism.For(
             queryHeads * tokenCount,
-            Parallelism.Options,
-            () => TensorPool.Rent(visible),
-            (index, _, scores) =>
+            index =>
             {
                 int head = index / tokenCount;
                 int token = index % tokenCount;
@@ -557,7 +571,8 @@ public sealed class ErnieDecoder
                 ReadOnlySpan<float> query = queries.Span.Slice((token * queryWidth) + (head * headDim), headDim);
                 ReadOnlySpan<float> keySpan = keyMemory.Span;
                 ReadOnlySpan<float> valueSpan = valueMemory.Span;
-                Span<float> scoreSpan = scores.Span[..limit];
+                using PooledBuffer scores = TensorPool.Rent(limit);
+                Span<float> scoreSpan = scores.Span;
 
                 int keyOffset = keyValueHead * headDim;
                 for (int j = 0; j < limit; j++)
@@ -577,10 +592,7 @@ public sealed class ErnieDecoder
                         Kernels.AddScaled(target, valueSpan.Slice((j * keyValueWidth) + keyOffset, headDim), weight);
                     }
                 }
-
-                return scores;
-            },
-            scores => scores.Dispose());
+            });
     }
 
     private sealed class LayerWeights

@@ -70,9 +70,43 @@ public static class Gemm
             throw new ArgumentException("Bias buffer is too small.", nameof(bias));
         }
 
+        if (FakeQuant.ActivationBits != 0 && rows >= FakeQuant.MinRows && weight.FromCheckpoint)
+        {
+            using PooledBuffer quantised = FakeQuant.Activations(x.Span, rows, inner);
+            LinearCore(quantised.Memory, rows, inner, weight, bias, y, cols);
+            return;
+        }
+
+        LinearCore(x, rows, inner, weight, bias, y, cols);
+    }
+
+    private static void LinearCore(
+        ReadOnlyMemory<float> x,
+        int rows,
+        int inner,
+        WeightMatrix weight,
+        ReadOnlyMemory<float> bias,
+        Memory<float> y,
+        int cols)
+    {
         if ((long)rows * cols * inner < ParallelThreshold || Environment.ProcessorCount <= 1)
         {
             RunPanel(x.Span, rows, inner, weight, bias.Span, y.Span, cols, 0, cols);
+            return;
+        }
+
+        // Many rows against weights that opted in go to the integer path.
+        if (GemmInt8.Applies(rows, weight))
+        {
+            GemmInt8.LinearMany(x, rows, inner, [new LinearPart(weight, bias, y)]);
+            return;
+        }
+
+        // Many rows go to the outer-product form, which has no final lane reductions and so runs
+        // the same arithmetic faster; it is not bit-identical to the dot form below, see GemmOuter.
+        if (GemmOuter.Applies(rows))
+        {
+            GemmOuter.Linear(x, rows, inner, weight, bias, y, cols);
             return;
         }
 
@@ -84,6 +118,199 @@ public static class Gemm
         int panels = (cols + panel - 1) / panel;
 
         RunPanelsInParallel(panels, panel, x, rows, inner, weight, bias, y, cols);
+    }
+
+    /// <summary>One projection of an input shared with others: its weight, bias and destination.</summary>
+    public readonly struct LinearPart
+    {
+        /// <summary>Describes one projection.</summary>
+        /// <param name="weight">Weight, <c>[cols, inner]</c>.</param>
+        /// <param name="bias">Optional bias of length <c>cols</c>; empty for none.</param>
+        /// <param name="output">Receives <c>[rows, cols]</c>.</param>
+        public LinearPart(WeightMatrix weight, ReadOnlyMemory<float> bias, Memory<float> output)
+        {
+            Weight = weight;
+            Bias = bias;
+            Output = output;
+        }
+
+        /// <summary>The weight, <c>[cols, inner]</c>.</summary>
+        public WeightMatrix Weight { get; }
+
+        /// <summary>The bias, or empty.</summary>
+        public ReadOnlyMemory<float> Bias { get; }
+
+        /// <summary>The destination, <c>[rows, cols]</c>.</summary>
+        public Memory<float> Output { get; }
+
+        /// <summary>Output columns.</summary>
+        public int Cols => Weight.Rows;
+    }
+
+    /// <summary>
+    /// Several projections of one input — a layer's query, key and value, or its gate and up —
+    /// computed together: <c>parts[i].Output = x · parts[i].Weightᵀ + parts[i].Bias</c>.
+    /// </summary>
+    /// <remarks>
+    /// Each output is exactly what <see cref="Linear"/> would give it, bit for bit, in either accumulation order. What is shared is the work around
+    /// them: the outer-product form packs the activations once rather than once per projection
+    /// (4-5% of the GEMM time of a tower pass, three times over for q, k and v), and all the
+    /// projections' column panels run in one parallel region rather than one each, so a decode
+    /// step has one region boundary where it had three.
+    /// </remarks>
+    /// <param name="x">Activations, <c>[rows, inner]</c>.</param>
+    /// <param name="rows">Number of activation rows.</param>
+    /// <param name="inner">Shared reduction length.</param>
+    /// <param name="parts">The projections; their weights may differ in width.</param>
+    public static void LinearMany(ReadOnlyMemory<float> x, int rows, int inner, LinearPart[] parts)
+    {
+        ArgumentNullException.ThrowIfNull(parts);
+
+        long work = 0;
+        foreach (LinearPart part in parts)
+        {
+            ValidateLinear(x, rows, inner, part.Weight, part.Bias, part.Output, part.Cols);
+            work += (long)rows * part.Cols * inner;
+        }
+
+        if (parts.Length == 1)
+        {
+            Linear(x, rows, inner, parts[0].Weight, parts[0].Bias, parts[0].Output, parts[0].Cols);
+            return;
+        }
+
+        if (FakeQuant.ActivationBits != 0 && rows >= FakeQuant.MinRows && parts[0].Weight.FromCheckpoint)
+        {
+            using PooledBuffer quantised = FakeQuant.Activations(x.Span, rows, inner);
+            LinearManyCore(quantised.Memory, rows, inner, parts, work);
+            return;
+        }
+
+        LinearManyCore(x, rows, inner, parts, work);
+    }
+
+    private static void LinearManyCore(ReadOnlyMemory<float> x, int rows, int inner, LinearPart[] parts, long work)
+    {
+
+        if (work < ParallelThreshold || Environment.ProcessorCount <= 1)
+        {
+            foreach (LinearPart part in parts)
+            {
+                RunPanel(x.Span, rows, inner, part.Weight, part.Bias.Span, part.Output.Span, part.Cols, 0, part.Cols);
+            }
+
+            return;
+        }
+
+        if (GemmInt8.AppliesToAll(rows, parts))
+        {
+            GemmInt8.LinearMany(x, rows, inner, parts);
+            return;
+        }
+
+        if (GemmOuter.Applies(rows))
+        {
+            GemmOuter.LinearMany(x, rows, inner, parts);
+            return;
+        }
+
+        PanelPlan plan = PanelPlan.Create(parts, inner);
+        RunPartsInParallel(plan, x, rows, inner);
+    }
+
+    // Kept out of the method above for the usual reason: a method that contains a lambda allocates
+    // its display class on entry, whichever branch runs.
+    private static void RunPartsInParallel(PanelPlan plan, ReadOnlyMemory<float> x, int rows, int inner) =>
+        Parallelism.For(plan.Total, index =>
+        {
+            (int part, int start, int count) = plan.Locate(index);
+            LinearPart p = plan.Parts[part];
+            RunPanel(x.Span, rows, inner, p.Weight, p.Bias.Span, p.Output.Span, p.Cols, start, count);
+        });
+
+    /// <summary>
+    /// The column panels of several projections as one numbered list, so a single parallel region
+    /// can claim them in turn.
+    /// </summary>
+    internal sealed class PanelPlan
+    {
+        private readonly int[] _widths;
+        private readonly int[] _first;
+
+        private PanelPlan(LinearPart[] parts, int[] widths, int[] first, int total)
+        {
+            Parts = parts;
+            _widths = widths;
+            _first = first;
+            Total = total;
+        }
+
+        /// <summary>The projections.</summary>
+        internal LinearPart[] Parts { get; }
+
+        /// <summary>Number of panels over every projection.</summary>
+        internal int Total { get; }
+
+        /// <summary>Builds the plan, each projection's panels sized as <see cref="ChoosePanelWidth"/> sizes them alone.</summary>
+        internal static PanelPlan Create(LinearPart[] parts, int inner)
+        {
+            int[] widths = new int[parts.Length];
+            int[] first = new int[parts.Length];
+            int total = 0;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                widths[i] = ChoosePanelWidth(inner, parts[i].Cols, parts[i].Weight.Dtype);
+                first[i] = total;
+                total += (parts[i].Cols + widths[i] - 1) / widths[i];
+            }
+
+            return new PanelPlan(parts, widths, first, total);
+        }
+
+        /// <summary>The projection, first column and column count of panel <paramref name="index"/>.</summary>
+        internal (int Part, int Start, int Count) Locate(int index)
+        {
+            int part = 0;
+            while (part + 1 < _first.Length && index >= _first[part + 1])
+            {
+                part++;
+            }
+
+            int start = (index - _first[part]) * _widths[part];
+            return (part, start, Math.Min(_widths[part], Parts[part].Cols - start));
+        }
+    }
+
+    private static void ValidateLinear(
+        ReadOnlyMemory<float> x,
+        int rows,
+        int inner,
+        WeightMatrix weight,
+        ReadOnlyMemory<float> bias,
+        Memory<float> y,
+        int cols)
+    {
+        if (weight.Rows != cols || weight.Cols != inner)
+        {
+            throw new ArgumentException(
+                $"Weight is [{weight.Rows}, {weight.Cols}] but the call needs [{cols}, {inner}].",
+                nameof(weight));
+        }
+
+        if (x.Length < (long)rows * inner)
+        {
+            throw new ArgumentException("Activation buffer is too small.", nameof(x));
+        }
+
+        if (y.Length < (long)rows * cols)
+        {
+            throw new ArgumentException("Output buffer is too small.", nameof(y));
+        }
+
+        if (!bias.IsEmpty && bias.Length < cols)
+        {
+            throw new ArgumentException("Bias buffer is too small.", nameof(bias));
+        }
     }
 
     /// <summary>
@@ -101,7 +328,7 @@ public static class Gemm
         ReadOnlyMemory<float> bias,
         Memory<float> y,
         int cols) =>
-        Parallel.For(0, panels, Parallelism.Options, index =>
+        Parallelism.For(panels, index =>
         {
             int start = index * panel;
             RunPanel(
@@ -121,11 +348,15 @@ public static class Gemm
     /// multiple of four that the tail costs nothing. Rounding the count up rather than the width
     /// down keeps every panel inside L2 and gives each worker the same number of them.
     /// </remarks>
-    private static int ChoosePanelWidth(int inner, int cols, DType dtype)
+    internal static int ChoosePanelWidth(int inner, int cols, DType dtype)
     {
         const int TargetPanelBytes = 256 * 1024;
 
-        int rowBytes = Math.Max(1, inner * dtype.ByteSize());
+        // A narrow dtype is widened to float32 before use, so what has to fit in L2 is four bytes an
+        // element whatever the storage: size the panel as if two bytes were stored, which is what
+        // it was sized by for bfloat16 and leaves that case unchanged. Int8 would otherwise get a
+        // panel twice as wide as L2 holds.
+        int rowBytes = Math.Max(1, inner * Math.Max(2, dtype.ByteSize()));
         int panel = Math.Max(ColBlock, TargetPanelBytes / rowBytes);
         panel = (panel + ColBlock - 1) / ColBlock * ColBlock;
 
@@ -201,9 +432,54 @@ public static class Gemm
             ? stored.Slice(colStart * inner, colCount * inner)
             : scratch;
 
+        // The wide tile reads through raw pointers: with span indexers every one of its eight
+        // loads per step carries a bounds check and its own address arithmetic, which measured
+        // 80 GFLOP/s per thread against 135-142 for the identical tile on pointers (one thread,
+        // panel in L2). It is the same tile with the same per-lane accumulation order, so the
+        // output is bit-identical.
+        bool wide = Simd.Use512 && inner >= Vector512<float>.Count && (inner & (Vector512<float>.Count - 1)) == 0;
+
         Span<float> tile = stackalloc float[16];
 
         int m = 0;
+        if (wide)
+        {
+            unsafe
+            {
+                fixed (float* px = x, pw = w, py = y)
+                {
+                    for (; m <= rows - RowBlock; m += RowBlock)
+                    {
+                        float* xm = px + ((long)m * inner);
+                        float* ym = py + ((long)m * cols) + colStart;
+
+                        int local = 0;
+                        for (; local <= colCount - ColBlock; local += ColBlock)
+                        {
+                            Tile4x4Wide(xm, inner, pw + ((long)local * inner), inner, ym + local, cols);
+                        }
+
+                        for (; local < colCount; local++)
+                        {
+                            ReadOnlySpan<float> wr = w.Slice(local * inner, inner);
+                            for (int r = 0; r < RowBlock; r++)
+                            {
+                                ym[(r * cols) + local] = Dot(x.Slice((m + r) * inner, inner), wr);
+                            }
+                        }
+
+                        if (!bias.IsEmpty)
+                        {
+                            for (int r = 0; r < RowBlock; r++)
+                            {
+                                Kernels.AddInPlace(y.Slice(((m + r) * cols) + colStart, colCount), bias[colStart..colEnd]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (; m <= rows - RowBlock; m += RowBlock)
         {
             ReadOnlySpan<float> x0 = x.Slice(m * inner, inner);
@@ -291,6 +567,90 @@ public static class Gemm
                 Kernels.AddInPlace(yr[colStart..colEnd], bias[colStart..colEnd]);
             }
         }
+    }
+
+    /// <summary>
+    /// The 512-bit four-by-four tile on raw pointers: sixteen dot products accumulated one lane
+    /// per output across the whole reduction, then reduced, exactly as <see cref="Dot4x4"/> does.
+    /// </summary>
+    /// <param name="x">First of four consecutive activation rows.</param>
+    /// <param name="xStride">Distance between activation rows.</param>
+    /// <param name="w">First of four consecutive widened weight rows.</param>
+    /// <param name="wStride">Distance between weight rows.</param>
+    /// <param name="y">Output element for row 0, column 0 of the tile.</param>
+    /// <param name="yStride">Distance between output rows.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void Tile4x4Wide(float* x, int xStride, float* w, int wStride, float* y, int yStride)
+    {
+        float* x0 = x;
+        float* x1 = x + xStride;
+        float* x2 = x + (2L * xStride);
+        float* x3 = x + (3L * xStride);
+        float* w0p = w;
+        float* w1p = w + wStride;
+        float* w2p = w + (2L * wStride);
+        float* w3p = w + (3L * wStride);
+
+        Vector512<float> a00 = Vector512<float>.Zero, a01 = Vector512<float>.Zero;
+        Vector512<float> a02 = Vector512<float>.Zero, a03 = Vector512<float>.Zero;
+        Vector512<float> a10 = Vector512<float>.Zero, a11 = Vector512<float>.Zero;
+        Vector512<float> a12 = Vector512<float>.Zero, a13 = Vector512<float>.Zero;
+        Vector512<float> a20 = Vector512<float>.Zero, a21 = Vector512<float>.Zero;
+        Vector512<float> a22 = Vector512<float>.Zero, a23 = Vector512<float>.Zero;
+        Vector512<float> a30 = Vector512<float>.Zero, a31 = Vector512<float>.Zero;
+        Vector512<float> a32 = Vector512<float>.Zero, a33 = Vector512<float>.Zero;
+
+        for (int i = 0; i < xStride; i += Vector512<float>.Count)
+        {
+            Vector512<float> w0 = Vector512.Load(w0p + i);
+            Vector512<float> w1 = Vector512.Load(w1p + i);
+            Vector512<float> w2 = Vector512.Load(w2p + i);
+            Vector512<float> w3 = Vector512.Load(w3p + i);
+
+            Vector512<float> v = Vector512.Load(x0 + i);
+            a00 = Vector512.FusedMultiplyAdd(v, w0, a00);
+            a01 = Vector512.FusedMultiplyAdd(v, w1, a01);
+            a02 = Vector512.FusedMultiplyAdd(v, w2, a02);
+            a03 = Vector512.FusedMultiplyAdd(v, w3, a03);
+
+            v = Vector512.Load(x1 + i);
+            a10 = Vector512.FusedMultiplyAdd(v, w0, a10);
+            a11 = Vector512.FusedMultiplyAdd(v, w1, a11);
+            a12 = Vector512.FusedMultiplyAdd(v, w2, a12);
+            a13 = Vector512.FusedMultiplyAdd(v, w3, a13);
+
+            v = Vector512.Load(x2 + i);
+            a20 = Vector512.FusedMultiplyAdd(v, w0, a20);
+            a21 = Vector512.FusedMultiplyAdd(v, w1, a21);
+            a22 = Vector512.FusedMultiplyAdd(v, w2, a22);
+            a23 = Vector512.FusedMultiplyAdd(v, w3, a23);
+
+            v = Vector512.Load(x3 + i);
+            a30 = Vector512.FusedMultiplyAdd(v, w0, a30);
+            a31 = Vector512.FusedMultiplyAdd(v, w1, a31);
+            a32 = Vector512.FusedMultiplyAdd(v, w2, a32);
+            a33 = Vector512.FusedMultiplyAdd(v, w3, a33);
+        }
+
+        y[0] = Vector512.Sum(a00);
+        y[1] = Vector512.Sum(a01);
+        y[2] = Vector512.Sum(a02);
+        y[3] = Vector512.Sum(a03);
+        y += yStride;
+        y[0] = Vector512.Sum(a10);
+        y[1] = Vector512.Sum(a11);
+        y[2] = Vector512.Sum(a12);
+        y[3] = Vector512.Sum(a13);
+        y += yStride;
+        y[0] = Vector512.Sum(a20);
+        y[1] = Vector512.Sum(a21);
+        y[2] = Vector512.Sum(a22);
+        y[3] = Vector512.Sum(a23);
+        y += yStride;
+        y[0] = Vector512.Sum(a30);
+        y[1] = Vector512.Sum(a31);
+        y[2] = Vector512.Sum(a32);
+        y[3] = Vector512.Sum(a33);
     }
 
     /// <summary>
@@ -574,7 +934,7 @@ public static class Gemm
         int rowBlock,
         int columnBlock,
         int columnTiles) =>
-        Parallel.For(0, tiles, Parallelism.Options, tile =>
+        Parallelism.For(tiles, tile =>
             RunTile(tile, a, b, y, m, k, n, transposeB, rowBlock, columnBlock, columnTiles));
 
     /// <summary>Computes one tile of the output.</summary>

@@ -19,12 +19,16 @@ public static class Attention
     /// </summary>
     /// <param name="queries">Queries as <c>[heads][tokens][headDim]</c>.</param>
     /// <param name="keys">Keys, same layout.</param>
-    /// <param name="values">Values, same layout.</param>
-    /// <param name="output">Receives the result in the same layout.</param>
+    /// <param name="values">Values, <c>[heads][tokens][rowStride]</c>.</param>
+    /// <param name="output">Receives the result, <c>[heads][tokens][rowStride]</c>.</param>
     /// <param name="heads">Number of heads.</param>
     /// <param name="tokens">Sequence length.</param>
     /// <param name="headDim">Width of one head.</param>
     /// <param name="scale">Softmax scale, normally <c>1 / sqrt(headDim)</c>.</param>
+    /// <param name="rowStride">
+    /// Floats per token in <paramref name="values"/> and <paramref name="output"/>, at least
+    /// <paramref name="headDim"/>; a multiple of sixteen keeps every row on a cache line.
+    /// </param>
     /// <param name="profile">
     /// Receives the parts' cost when supplied. Attention runs a thread per head, so nothing
     /// outside it can attribute its time; each thread accumulates its own and they are summed.
@@ -38,6 +42,7 @@ public static class Attention
         int tokens,
         int headDim,
         float scale,
+        int rowStride,
         StageProfile? profile = null)
     {
         // Wide enough that a block amortises the key and value traffic, narrow enough that the
@@ -46,29 +51,37 @@ public static class Attention
 
         long transposeTicks = 0, scoreTicks = 0, softmaxTicks = 0, valueTicks = 0;
 
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        // Every row the kernels read or write as a vector starts on a cache line: the transposed
+        // keys and the score rows are padded to a multiple of sixteen floats, and the values and
+        // the output keep `rowStride` floats per token (80 for a head width of 72, which is five
+        // lines where 72 floats is four and a half). A 512-bit load that straddles two lines costs
+        // two, and these kernels issue nothing else. Padding moves data and changes no arithmetic.
+        int keyStride = (tokens + 15) & ~15;
+
+        Parallelism.For(heads, head =>
         {
             int headOffset = head * tokens * headDim;
+            int paddedOffset = head * tokens * rowStride;
 
             ReadOnlyMemory<float> k = keys.Slice(headOffset, tokens * headDim);
-            ReadOnlyMemory<float> v = values.Slice(headOffset, tokens * headDim);
+            ReadOnlyMemory<float> v = values.Slice(paddedOffset, tokens * rowStride);
 
-            using PooledBuffer buffer = TensorPool.Rent(Block * tokens);
+            using PooledBuffer buffer = TensorPool.Rent(Block * keyStride);
             Memory<float> scores = buffer.Memory;
 
             // One transpose of this head's keys serves every row-block below, of which there are
             // `tokens / Block`. See AttentionKernels for why the score product wants them this
             // way round.
-            using PooledBuffer keysT = TensorPool.Rent(tokens * headDim);
+            using PooledBuffer keysT = TensorPool.Rent(headDim * keyStride);
             long mark = Stopwatch.GetTimestamp();
-            AttentionKernels.TransposeHead(k.Span, tokens, headDim, keysT.Span);
+            AttentionKernels.TransposeHead(k.Span, tokens, headDim, keysT.Span, keyStride);
             long transpose = Stopwatch.GetTimestamp() - mark;
             long score = 0, soft = 0, value = 0;
 
             for (int start = 0; start < tokens; start += Block)
             {
                 int rows = Math.Min(Block, tokens - start);
-                Memory<float> block = scores[..(rows * tokens)];
+                Memory<float> block = scores[..(rows * keyStride)];
 
                 mark = Stopwatch.GetTimestamp();
                 AttentionKernels.Scores(
@@ -77,14 +90,16 @@ public static class Attention
                     headDim,
                     keysT.Span,
                     tokens,
-                    block.Span);
+                    keyStride,
+                    block.Span,
+                    keyStride);
                 score += Stopwatch.GetTimestamp() - mark;
 
                 mark = Stopwatch.GetTimestamp();
                 Span<float> rowsSpan = block.Span;
                 for (int row = 0; row < rows; row++)
                 {
-                    Kernels.ScaledSoftmax(rowsSpan.Slice(row * tokens, tokens), scale);
+                    Kernels.ScaledSoftmax(rowsSpan.Slice(row * keyStride, tokens), scale);
                 }
 
                 soft += Stopwatch.GetTimestamp() - mark;
@@ -92,11 +107,14 @@ public static class Attention
 
                 AttentionKernels.Values(
                     block.Span,
+                    keyStride,
                     rows,
                     tokens,
                     v.Span,
                     headDim,
-                    output.Span.Slice(headOffset + (start * headDim), rows * headDim));
+                    rowStride,
+                    output.Span.Slice(paddedOffset + (start * rowStride), rows * rowStride),
+                    rowStride);
                 value += Stopwatch.GetTimestamp() - mark;
             }
 

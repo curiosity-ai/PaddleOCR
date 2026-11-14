@@ -79,6 +79,72 @@ public static class Parallelism
     /// </remarks>
     public static Scope Use(ParallelOptions? options) => new(options);
 
+    /// <summary>
+    /// Sets the options the calling thread's kernels see and returns what was there, for a worker
+    /// thread that adopts the options of the caller whose region it is helping with.
+    /// </summary>
+    internal static ParallelOptions? SetScoped(ParallelOptions? options)
+    {
+        ParallelOptions? previous = Scoped.Value;
+        Scoped.Value = options;
+        return previous;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> for every index in <c>[0, count)</c> across the kernels'
+    /// degree of parallelism: the drop-in for <c>Parallel.For(0, count, Parallelism.Options, body)</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Regions go to <see cref="WorkTeam"/>, whose threads stay awake between them. Two things a
+    /// <see cref="ParallelOptions"/> says are honoured, by the team where it can and by
+    /// <see cref="Parallel.For(int, int, ParallelOptions, Action{int})"/> where it cannot:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// <see cref="ParallelOptions.MaxDegreeOfParallelism"/> bounds the threads a region uses, the
+    /// caller included, and the team never exceeds one per core. <c>-1</c>, which means unbounded,
+    /// is passed to <c>Parallel.For</c> untouched rather than read as "one per core".
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="ParallelOptions.CancellationToken"/> is checked before every item, and a region
+    /// cancelled that way throws <see cref="OperationCanceledException"/>.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// <see cref="ParallelOptions.TaskScheduler"/> is not consulted: the kernels never ask for one.
+    /// A region that finds the team busy, or that asks for a single worker, takes <c>Parallel.For</c>.
+    /// Exceptions from a body surface as an <see cref="AggregateException"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="count">Number of items.</param>
+    /// <param name="body">The work for one item.</param>
+    public static void For(int count, Action<int> body)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        ParallelOptions options = Options;
+        int workers = options.MaxDegreeOfParallelism;
+
+        // Unbounded is Parallel.For's own business: the team never exceeds one thread per core.
+        if (workers == -1)
+        {
+            Parallel.For(0, count, options, body);
+            return;
+        }
+
+        workers = Math.Min(workers, count);
+        if (workers > 1 && WorkTeam.TryRun(count, workers, options, body))
+        {
+            return;
+        }
+
+        Parallel.For(0, count, options, body);
+    }
+
     /// <summary>Elements below which splitting a pass across threads costs more than it saves.</summary>
     private const int MinimumChunk = 1 << 15;
 
@@ -109,7 +175,7 @@ public static class Parallelism
         }
 
         int size = ((length - 1) / chunks) + 1;
-        Parallel.For(0, chunks, Options, chunk =>
+        For(chunks, chunk =>
         {
             int start = chunk * size;
             body(start, Math.Min(length, start + size));

@@ -186,6 +186,35 @@ measurement was right and the conclusion wrong.
 
 ---
 
+## 10. Lessons from tuning the 100 and 150 dpi pages
+
+Four things that were found by measuring and would not have been found by profiling the kernels.
+
+- **Check a ceiling against an independent loop before believing it.** The calibration in `bench`
+  reported 988 GFLOP/s for one thread; a separate twelve-chain `a = a*m + c` loop measured 224, and
+  the GEMM's own best tile is 155. A fraction of a wrong ceiling is worse than no fraction, so the
+  first thing to do on a new machine is run `dotnet run -c Release --project dotnet/tools/ceilings`,
+  which has no reference to the library and so cannot share a bug with it, and compare. On the
+  machine of that pass it said 226 / 459 / 863 GFLOP/s at one, two and four threads and 14 / 23 /
+  42 GB/s of streaming read.
+- **A kernel at 30% of peak is not necessarily a bad kernel.** The GEMM tile measured 137 GFLOP/s on
+  its own and 331 over four threads in the library, 483 over four threads in a harness. The
+  difference was found by cloning the library's panel structure in the harness and removing one
+  piece at a time — widening, rent, scheduling — until the piece that moved the number was the
+  buffer's *address*. 512-bit loads from a .NET array straddle two cache lines; align the data.
+- **Measure what each thread does inside a parallel region, not only how long the region takes.** A
+  region that streamed 12 MB in 430 us had per-thread busy times of 388 / 395 / 186 / 117 us: the
+  other two workers had been parked since the last region and joined late. Wall time said "29 GB/s";
+  the per-thread split said "two cores". The fix was a team that spins, and the test that it worked
+  was the same split.
+- **`SpinWait.SpinOnce` is not a spin.** It escalates to `Thread.Sleep(1)`, and a sleep of a
+  millisecond is longer than the work being waited for. A hand-written wait loop that made things
+  *slower* than `Parallel.For` was this, and nothing in the code said so.
+
+Also: a microbenchmark that cycles through *distinct* weight matrices larger than the last-level
+cache (`--cold`-style, 32 matrices of 12 MB) measures decode; one that repeats a single matrix
+measures L3 and reports 66 GB/s for something that streams at 45.
+
 ## Checklist before quoting a performance result
 
 - [ ] The machine was calibrated in the same run, and the jitter is stated.

@@ -13,7 +13,7 @@ public static class DownloadCommand
 
         if (command.Positional.Count == 0)
         {
-            models.Add(ModelCatalog.PaddleOcrVL16);
+            models.Add(ModelCatalog.VisionLanguageFor(ModelLocator.QuantizationFrom(command)));
             models.Add(ModelCatalog.PpDocLayoutV3);
         }
         else

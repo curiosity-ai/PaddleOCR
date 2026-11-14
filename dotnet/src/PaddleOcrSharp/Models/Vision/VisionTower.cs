@@ -69,17 +69,17 @@ public sealed class VisionTower
                 Norm1Bias = weights.Vector(layer + "layer_norm1.bias"),
                 Norm2Weight = weights.Vector(layer + "layer_norm2.weight"),
                 Norm2Bias = weights.Vector(layer + "layer_norm2.bias"),
-                Query = weights.Matrix(layer + "self_attn.q_proj.weight"),
+                Query = weights.Matrix(layer + "self_attn.q_proj.weight", WeightRole.Vision),
                 QueryBias = weights.Vector(layer + "self_attn.q_proj.bias"),
-                Key = weights.Matrix(layer + "self_attn.k_proj.weight"),
+                Key = weights.Matrix(layer + "self_attn.k_proj.weight", WeightRole.Vision),
                 KeyBias = weights.Vector(layer + "self_attn.k_proj.bias"),
-                Value = weights.Matrix(layer + "self_attn.v_proj.weight"),
+                Value = weights.Matrix(layer + "self_attn.v_proj.weight", WeightRole.Vision),
                 ValueBias = weights.Vector(layer + "self_attn.v_proj.bias"),
-                Output = weights.Matrix(layer + "self_attn.out_proj.weight"),
+                Output = weights.Matrix(layer + "self_attn.out_proj.weight", WeightRole.Vision),
                 OutputBias = weights.Vector(layer + "self_attn.out_proj.bias"),
-                Fc1 = weights.Matrix(layer + "mlp.fc1.weight"),
+                Fc1 = weights.Matrix(layer + "mlp.fc1.weight", WeightRole.Vision),
                 Fc1Bias = weights.Vector(layer + "mlp.fc1.bias"),
-                Fc2 = weights.Matrix(layer + "mlp.fc2.weight"),
+                Fc2 = weights.Matrix(layer + "mlp.fc2.weight", WeightRole.Vision),
                 Fc2Bias = weights.Vector(layer + "mlp.fc2.bias"),
             };
         }
@@ -91,9 +91,9 @@ public sealed class VisionTower
         {
             PreNormWeight = weights.Vector("mlp_AR.pre_norm.weight"),
             PreNormBias = weights.Vector("mlp_AR.pre_norm.bias"),
-            Linear1 = weights.Matrix("mlp_AR.linear_1.weight"),
+            Linear1 = weights.Matrix("mlp_AR.linear_1.weight", WeightRole.Vision),
             Linear1Bias = weights.Vector("mlp_AR.linear_1.bias"),
-            Linear2 = weights.Matrix("mlp_AR.linear_2.weight"),
+            Linear2 = weights.Matrix("mlp_AR.linear_2.weight", WeightRole.Vision),
             Linear2Bias = weights.Vector("mlp_AR.linear_2.bias"),
         };
 
@@ -158,9 +158,13 @@ public sealed class VisionTower
         using PooledBuffer normed = TensorPool.Rent(tokens * width);
         using PooledBuffer queries = TensorPool.Rent(tokens * width);
         using PooledBuffer keys = TensorPool.Rent(tokens * width);
-        using PooledBuffer values = TensorPool.Rent(tokens * width);
-        using PooledBuffer attention = TensorPool.Rent(tokens * width);
+        // Per-head rows of the values and the attention output are padded to whole cache lines.
+        int rowStride = (headDim + 15) & ~15;
+        using PooledBuffer values = TensorPool.Rent(heads * tokens * rowStride);
+        using PooledBuffer attention = TensorPool.Rent(heads * tokens * rowStride);
         using PooledBuffer packed = TensorPool.Rent(tokens * width);
+        using PooledBuffer packedKeys = TensorPool.Rent(tokens * width);
+        using PooledBuffer packedValues = TensorPool.Rent(tokens * width);
         using PooledBuffer intermediate = TensorPool.Rent(tokens * _config.IntermediateSize);
 
         float scale = 1f / MathF.Sqrt(headDim);
@@ -175,34 +179,26 @@ public sealed class VisionTower
                 Norms.LayerNormParallel(normed.Memory, width, layer.Norm1Weight, layer.Norm1Bias, _config.LayerNormEps);
             }
 
+            // One call for the three projections: the activations are packed once, and the three
+            // sets of column panels run in one parallel region.
             using (profile?.Measure("qkv gemm"))
             {
-                Gemm.Linear(normed.Memory, tokens, width, layer.Query, layer.QueryBias, packed.Memory, width);
+                Gemm.LinearMany(
+                    normed.Memory,
+                    tokens,
+                    width,
+                    [
+                        new Gemm.LinearPart(layer.Query, layer.QueryBias, packed.Memory),
+                        new Gemm.LinearPart(layer.Key, layer.KeyBias, packedKeys.Memory),
+                        new Gemm.LinearPart(layer.Value, layer.ValueBias, packedValues.Memory),
+                    ]);
             }
 
             using (profile?.Measure("rope+split"))
             {
                 SplitHeadsWithRope(packed.Memory, queries.Memory, tokens, heads, headDim, cos.Memory, sin.Memory);
-            }
-
-            using (profile?.Measure("qkv gemm"))
-            {
-                Gemm.Linear(normed.Memory, tokens, width, layer.Key, layer.KeyBias, packed.Memory, width);
-            }
-
-            using (profile?.Measure("rope+split"))
-            {
-                SplitHeadsWithRope(packed.Memory, keys.Memory, tokens, heads, headDim, cos.Memory, sin.Memory);
-            }
-
-            using (profile?.Measure("qkv gemm"))
-            {
-                Gemm.Linear(normed.Memory, tokens, width, layer.Value, layer.ValueBias, packed.Memory, width);
-            }
-
-            using (profile?.Measure("rope+split"))
-            {
-                SplitHeads(packed.Memory, values.Memory, tokens, heads, headDim);
+                SplitHeadsWithRope(packedKeys.Memory, keys.Memory, tokens, heads, headDim, cos.Memory, sin.Memory);
+                SplitHeads(packedValues.Memory, values.Memory, tokens, heads, headDim, rowStride);
             }
 
             using (profile?.Measure("attention"))
@@ -211,12 +207,12 @@ public sealed class VisionTower
                 // per head, so nothing outside it can see where its time went.
                 Attention.Bidirectional(
                     queries.Memory, keys.Memory, values.Memory, attention.Memory,
-                    heads, tokens, headDim, scale, profile);
+                    heads, tokens, headDim, scale, rowStride, profile);
             }
 
             using (profile?.Measure("rope+split"))
             {
-                MergeHeads(attention.Memory, packed.Memory, tokens, heads, headDim);
+                MergeHeads(attention.Memory, packed.Memory, tokens, heads, headDim, rowStride);
             }
 
             using (profile?.Measure("out gemm"))
@@ -364,7 +360,7 @@ public sealed class VisionTower
         ReadOnlyMemory<float> sin)
     {
         int width = heads * headDim;
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        Parallelism.For(heads, head =>
         {
             int headBase = head * tokens * headDim;
             ReadOnlySpan<float> source = packed.Span;
@@ -388,19 +384,20 @@ public sealed class VisionTower
         Memory<float> destination,
         int tokens,
         int heads,
-        int headDim)
+        int headDim,
+        int rowStride)
     {
         int width = heads * headDim;
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        Parallelism.For(heads, head =>
         {
-            int headBase = head * tokens * headDim;
+            int headBase = head * tokens * rowStride;
             ReadOnlySpan<float> source = packed.Span;
             Span<float> target = destination.Span;
 
             for (int token = 0; token < tokens; token++)
             {
                 source.Slice((token * width) + (head * headDim), headDim)
-                    .CopyTo(target.Slice(headBase + (token * headDim), headDim));
+                    .CopyTo(target.Slice(headBase + (token * rowStride), headDim));
             }
         });
     }
@@ -411,18 +408,19 @@ public sealed class VisionTower
         Memory<float> destination,
         int tokens,
         int heads,
-        int headDim)
+        int headDim,
+        int rowStride)
     {
         int width = heads * headDim;
-        Parallel.For(0, heads, Parallelism.Options, head =>
+        Parallelism.For(heads, head =>
         {
-            int headBase = head * tokens * headDim;
+            int headBase = head * tokens * rowStride;
             ReadOnlySpan<float> source = perHead.Span;
             Span<float> target = destination.Span;
 
             for (int token = 0; token < tokens; token++)
             {
-                source.Slice(headBase + (token * headDim), headDim)
+                source.Slice(headBase + (token * rowStride), headDim)
                     .CopyTo(target.Slice((token * width) + (head * headDim), headDim));
             }
         });

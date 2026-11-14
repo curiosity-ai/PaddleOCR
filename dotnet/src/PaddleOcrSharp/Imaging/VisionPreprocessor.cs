@@ -94,7 +94,7 @@ public static class VisionPreprocessor
 
         Memory<float> destination = pixelValues.Memory;
 
-        Parallel.For(0, gridHeight, Parallelism.Options, gy =>
+        Parallelism.For(gridHeight, gy =>
         {
             Span<float> output = destination.Span;
             for (int gx = 0; gx < gridWidth; gx++)

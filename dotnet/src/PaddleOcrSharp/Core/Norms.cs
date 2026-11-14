@@ -108,7 +108,7 @@ public static class Norms
 
         int threads = Environment.ProcessorCount;
         int chunk = (rows + threads - 1) / threads;
-        Parallel.For(0, (rows + chunk - 1) / chunk, Parallelism.Options, block =>
+        Parallelism.For((rows + chunk - 1) / chunk, block =>
         {
             int start = block * chunk;
             int count = Math.Min(chunk, rows - start);
@@ -139,7 +139,7 @@ public static class Norms
 
         int threads = Environment.ProcessorCount;
         int chunk = (rows + threads - 1) / threads;
-        Parallel.For(0, (rows + chunk - 1) / chunk, Parallelism.Options, block =>
+        Parallelism.For((rows + chunk - 1) / chunk, block =>
         {
             int start = block * chunk;
             int count = Math.Min(chunk, rows - start);
