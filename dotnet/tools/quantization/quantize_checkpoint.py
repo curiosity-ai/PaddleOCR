@@ -49,11 +49,26 @@ def main():
     ap.add_argument("--source", default=os.path.expanduser("~/.cache/paddleocr-sharp/PaddleOCR-VL-1.6"))
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    for name in os.listdir(a.source):
-        if name != "model.safetensors":
-            shutil.copy2(os.path.join(a.source, name), os.path.join(a.out_dir, name))
 
-    path = os.path.join(a.source, "model.safetensors")
+    # A download cache can wrap the checkpoint in a folder (for instance `main/`). Use the folder that
+    # actually holds model.safetensors: the source itself, or the one subfolder that does.
+    source = a.source
+    if not os.path.isfile(os.path.join(source, "model.safetensors")):
+        nested = [d for d in sorted(os.listdir(source))
+                  if os.path.isfile(os.path.join(source, d, "model.safetensors"))]
+        if len(nested) != 1:
+            sys.exit(f"no model.safetensors in {source}" + (f" or in exactly one subfolder (found {nested})" if nested else ""))
+        source = os.path.join(source, nested[0])
+        print(f"using the checkpoint in {source}")
+
+    # Copy the small files (config, tokenizer, ...) beside the new weights. Files only: a cache may
+    # keep folders in here, and they are not part of the checkpoint.
+    for name in os.listdir(source):
+        src = os.path.join(source, name)
+        if name != "model.safetensors" and os.path.isfile(src):
+            shutil.copy2(src, os.path.join(a.out_dir, name))
+
+    path = os.path.join(source, "model.safetensors")
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(n))
